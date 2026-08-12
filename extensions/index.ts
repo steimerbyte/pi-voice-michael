@@ -26,9 +26,53 @@ const MODEL_ID = "onnx-community/Kokoro-82M-v1.0-ONNX";
 //     ├── tokenizer_config.json
 //     └── onnx/
 //         └── model_quantized.onnx    (~89 MB)
-const PLUGIN_CACHE_DIR = join(homedir(), ".pi", "agent", "cache", "pi-voice-michael");
+const PLUGIN_CACHE_DIR = join(homedir(), ".pi", "voice");
 const MODEL_DIR = join(PLUGIN_CACHE_DIR, "onnx-community", "Kokoro-82M-v1.0-ONNX");
 const ONNX_DIR = join(MODEL_DIR, "onnx");
+
+// Legacy cache paths from earlier versions — auto-migrate on first run
+const LEGACY_CACHE_PATHS = [
+  join(homedir(), ".pi", "agent", "cache", "pi-voice-michael"),
+  join(homedir(), ".cache", "huggingface", "hub", "models--onnx-community--Kokoro-82M-v1.0-ONNX"),
+  join(homedir(), ".cache", "huggingface", "models--onnx-community--Kokoro-82M-v1.0-ONNX"),
+];
+
+// On startup, if the new cache is missing but a legacy one exists, symlink it
+function migrateLegacyCache(): void {
+  if (existsSync(ONNX_DIR) && existsSync(MODEL_DIR)) return; // already migrated
+  for (const legacy of LEGACY_CACHE_PATHS) {
+    if (!existsSync(legacy)) continue;
+    try {
+      // Map legacy onnx-community path → our onnx-community path
+      const legacyRepoDir = legacy.includes("models--")
+        ? join(legacy, "snapshots")
+        : join(legacy, "onnx-community", "Kokoro-82M-v1.0-ONNX");
+      if (!existsSync(legacyRepoDir)) continue;
+      mkdir(join(PLUGIN_CACHE_DIR, "onnx-community"), { recursive: true });
+      // Try hard-link or symlink; fall back to copy
+      const target = MODEL_DIR;
+      try {
+        mkdir(target, { recursive: true });
+        for (const f of ["model_quantized.onnx", "config.json", "tokenizer.json", "tokenizer_config.json"]) {
+          const src = join(legacyRepoDir, f);
+          const dst = f === "model_quantized.onnx" ? join(ONNX_DIR, f) : join(MODEL_DIR, f);
+          if (!existsSync(src) || existsSync(dst)) continue;
+          // Hard-link if possible (instant, no extra disk space)
+          try {
+            require("node:fs").linkSync(src, dst);
+          } catch {
+            // Fall back to copy
+            const { copyFile } = require("node:fs/promises");
+            copyFile(src, dst).catch(() => {});
+          }
+        }
+      } catch { /* swallow */ }
+      return;
+    } catch { /* try next */ }
+  }
+}
+// Run migration at module load (sync, fast)
+migrateLegacyCache();
 
 const MODEL_FILES: Record<string, { path: string; expectedBytes: number }> = {
   "onnx/model_quantized.onnx": { path: join(ONNX_DIR, "model_quantized.onnx"), expectedBytes: 90_000_000 },
@@ -359,6 +403,8 @@ export default function (pi: ExtensionAPI) {
     voice: string,
     onUpdate?: (msg: string, percent?: number) => void,
   ): Promise<{ ok: boolean; voice: string; text: string; file?: string; error?: string }> {
+    const dir = await mkdtemp(join(tmpdir(), "pi-voice-"));
+    const wavPath = join(dir, `speech-${Date.now()}.wav`);
     try {
       onUpdate?.("Initializing…", 5);
       const t0 = Date.now();
@@ -369,20 +415,46 @@ export default function (pi: ExtensionAPI) {
       const audio = await model.generate(text, { voice } as unknown as Record<string, string>);
       onUpdate?.(`Synthesized in ${((Date.now() - t1) / 1000).toFixed(1)}s, preparing playback…`, 90);
 
-      const dir = await mkdtemp(join(tmpdir(), "pi-voice-"));
-      const wavPath = join(dir, `speech-${Date.now()}.wav`);
       await audio.save(wavPath);
       onUpdate?.("Playing through speakers…", 95);
 
       try {
         await playWav(wavPath);
       } finally {
-        rm(dir, { recursive: true, force: true }).catch(() => {});
+        // Free the audio buffer + WAV file BEFORE returning
+        try { (audio as unknown as { data?: Float32Array }).data = undefined; } catch {}
       }
       return { ok: true, voice, text, file: wavPath };
     } catch (err: unknown) {
       return { ok: false, voice, text, error: (err as Error)?.message ?? String(err) };
+    } finally {
+      // Always clean up temp WAV file (memory + disk)
+      rm(dir, { recursive: true, force: true }).catch(() => {});
+      // Hint GC: release model reference if idle for >5 minutes (cheap idle check)
+      scheduleIdleUnload();
     }
+  }
+
+  // ─── Idle unload: release Kokoro after 5min of inactivity ────────────
+  // Kokoro caches every voice it has ever used in an internal Map that is
+  // never garbage-collected. After many voice switches, that map can hold
+  // dozens of 510KB Float32Arrays (~2MB heap each). We force release the
+  // whole Kokoro instance after 5min idle, then reload on next call.
+  let idleTimer: NodeJS.Timeout | null = null;
+  function scheduleIdleUnload(): void {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      const mem = process.memoryUsage();
+      const rssMB = Math.round(mem.rss / 1024 / 1024);
+      // Unload if either: (a) RSS > 500 MB or (b) we've been idle for the full
+      // 5 minutes regardless. The latter is cheap insurance.
+      tts = null;
+      ttsLoading = null;
+      if (global.gc) {
+        try { global.gc(); } catch {}
+      }
+      idleTimer = null;
+    }, 5 * 60 * 1000);
   }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────
