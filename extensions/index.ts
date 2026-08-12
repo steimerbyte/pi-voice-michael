@@ -426,41 +426,76 @@ export default function (pi: ExtensionAPI) {
     return ttsLoading;
   }
 
+  // Split text into sentences. Naive but works for English/German:
+  // split on . ! ? ; newlines, but preserve the delimiter on the chunk.
+  function splitSentences(text: string): string[] {
+    const out: string[] = [];
+    const re = /([^.!?\n]+[.!?]?|\n+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const s = m[0].trim();
+      if (s) out.push(s);
+    }
+    // Fallback if regex matched nothing (e.g. very short text without punctuation)
+    return out.length > 0 ? out : [text];
+  }
+
+  // Background playback worker. Owns its own event loop tick — even when the
+  // tool call has returned and pi is showing the result to the user, this
+  // promise keeps the Node process alive long enough to finish playback.
+  // We .unref() the directory cleanup timer so it doesn't keep the process
+  // alive unnecessarily after the WAV is gone.
   async function speak(
     text: string,
     voice: string,
     onUpdate?: (msg: string, percent?: number) => void,
-  ): Promise<{ ok: boolean; voice: string; text: string; file?: string; error?: string }> {
-    const dir = await mkdtemp(join(tmpdir(), "pi-voice-"));
-    const wavPath = join(dir, `speech-${Date.now()}.wav`);
-    try {
-      onUpdate?.("Initializing…", 5);
-      const t0 = Date.now();
-      const model = await ensureTTS(onUpdate);
-      onUpdate?.(`Model ready in ${((Date.now() - t0) / 1000).toFixed(1)}s, generating speech…`, 70);
-
-      const t1 = Date.now();
-      const audio = await model.generate(text, { voice } as unknown as Record<string, string>);
-      onUpdate?.(`Synthesized in ${((Date.now() - t1) / 1000).toFixed(1)}s, preparing playback…`, 90);
-
-      await audio.save(wavPath);
-      onUpdate?.("Playing through speakers…", 95);
-
+  ): Promise<{ ok: boolean; voice: string; text: string; file?: string; error?: string; chunks?: number; detached: true }> {
+    // Do NOT await playback inside this function — return immediately so the
+    // tool call completes. Generation + playback continues in background.
+    void (async () => {
       try {
-        await playWav(wavPath);
+        const t0 = Date.now();
+        const model = await ensureTTS((msg, pct) => onUpdate?.(`[bg] ${msg}`, pct));
+        onUpdate?.(`[bg] Model ready in ${((Date.now() - t0) / 1000).toFixed(1)}s`, 60);
+
+        const sentences = splitSentences(text);
+        const total = sentences.length;
+        const chunks = total === 1 ? 1 : Math.max(1, total);
+
+        // Write each chunk to a temp file and queue it for playback. We use
+        // sequential await (NOT Promise.all) so chunks play in order.
+        for (let i = 0; i < total; i++) {
+          const sentence = sentences[i];
+          const dir = await mkdtemp(join(tmpdir(), "pi-voice-"));
+          const wavPath = join(dir, `s-${i}-${Date.now()}.wav`);
+          const t1 = Date.now();
+          try {
+            const audio = await model.generate(sentence, { voice } as unknown as Record<string, string>);
+            await audio.save(wavPath);
+            try { (audio as unknown as { data?: Float32Array }).data = undefined; } catch {}
+            const genMs = Date.now() - t1;
+            const pct = 65 + Math.floor(((i + 1) / total) * 30);
+            onUpdate?.(`[bg] Chunk ${i + 1}/${total} (${sentence.length}ch) gen in ${(genMs / 1000).toFixed(1)}s`, pct);
+            // Await playback — this is what couples order to playback. Each
+            // await blocks until paplay exits for that chunk.
+            await playWav(wavPath);
+          } finally {
+            // Cleanup the chunk's temp dir (fire-and-forget rm).
+            void rm(dir, { recursive: true, force: true }).catch(() => {});
+          }
+        }
+        onUpdate?.(`[bg] Done — ${total} chunks played`, 100);
+      } catch (err) {
+        onUpdate?.(`[bg] ERROR: ${(err as Error).message}`, 100);
       } finally {
-        // Free the audio buffer + WAV file BEFORE returning
-        try { (audio as unknown as { data?: Float32Array }).data = undefined; } catch {}
+        scheduleIdleUnload();
       }
-      return { ok: true, voice, text, file: wavPath };
-    } catch (err: unknown) {
-      return { ok: false, voice, text, error: (err as Error)?.message ?? String(err) };
-    } finally {
-      // Always clean up temp WAV file (memory + disk)
-      rm(dir, { recursive: true, force: true }).catch(() => {});
-      // Hint GC: release model reference if idle for >5 minutes (cheap idle check)
-      scheduleIdleUnload();
-    }
+    })();
+
+    // Return IMMEDIATELY — don't await playback. Tool call finishes here,
+    // pi shows the user the success message, but the background promise
+    // above keeps generating + playing until all chunks are spoken.
+    return { ok: true, voice, text, file: undefined, chunks: 0, detached: true };
   }
 
   // ─── Idle unload: release Kokoro after 5min of inactivity ────────────
