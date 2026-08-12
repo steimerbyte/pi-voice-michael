@@ -488,11 +488,36 @@ export default function (pi: ExtensionAPI) {
         lines.push(`⚠️  **${failed} check(s) failed.** Fix above, then re-run /voice-doctor.`);
       }
 
+      // Output strategy: split into multiple notify() calls (one per section)
+      // so nothing gets truncated. The widget holds only a compact summary.
       const headline = offlineCapable
-        ? "🎉 Voice TTS: 100% offline-capable"
-        : `Voice TTS: ${passed}/${checks.length} checks passed`;
+        ? `🎉 Voice TTS: 100% offline-capable (${passed}/${checks.length})`
+        : `Voice TTS: ${passed}/${checks.length} checks passed — see issues below`;
       ctx.ui.notify(headline, offlineCapable ? "info" : "error");
-      ctx.ui.setWidget("voice-doctor", lines);
+
+      // Find the indices of the section headers (## N. ...) to slice lines
+      const sectionHeaders: { idx: number; title: string }[] = [];
+      for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(/^## (\d+\..*)/);
+        if (m) sectionHeaders.push({ idx: i, title: m[1] });
+      }
+      // Push each section as its own notification
+      for (let i = 0; i < sectionHeaders.length; i++) {
+        const start = sectionHeaders[i].idx;
+        const end = i + 1 < sectionHeaders.length ? sectionHeaders[i + 1].idx : lines.length - 1;
+        // Also include "Summary" as the last section
+        const block = lines.slice(start, end).join("\n");
+        const failedInSection = block.includes("❌");
+        ctx.ui.notify(block, failedInSection ? "error" : "info");
+      }
+
+      // Compact single-line widget — never truncated
+      const summaryLines = [
+        `pi-voice-michael: ${passed}/${checks.length} checks ✓`,
+        ...checks.map((c) => `  ${c.ok ? "✓" : "❌"} ${c.name}`),
+        offlineCapable ? "🎉 Fully offline-capable" : "⚠️  Issues reported above",
+      ];
+      ctx.ui.setWidget("voice-doctor", summaryLines);
     },
   });
 
