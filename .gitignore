@@ -1,0 +1,26 @@
+# Compiled output
+dist/
+*.js
+*.js.map
+*.d.ts
+!extensions/*.d.ts
+
+# Dependencies
+node_modules/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Pi cache
+.cache/
+.kokoro/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+*.tmp
+*.log

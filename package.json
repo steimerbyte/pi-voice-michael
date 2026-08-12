@@ -1,0 +1,39 @@
+{
+  "name": "@steimerbyte/pi-voice-michael",
+  "version": "0.1.0",
+  "description": "Offline neural TTS for Pi — gives your agent the am_michael voice (Kokoro ONNX, US English male). Fully local, no API keys.",
+  "type": "module",
+  "main": "extensions/index.js",
+  "types": "extensions/index.d.ts",
+  "files": [
+    "extensions",
+    "README.md"
+  ],
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "tts",
+    "text-to-speech",
+    "kokoro",
+    "onnx",
+    "offline"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node test/test.js"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.5.0",
+    "kokoro-js": "^1.2.1",
+    "onnxruntime-node": "^1.20.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
