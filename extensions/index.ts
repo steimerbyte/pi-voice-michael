@@ -104,14 +104,22 @@ async function isCacheComplete(): Promise<CacheStatus> {
   return { complete, files };
 }
 
-function missingModelError(): string {
-  return (
-    `Supertonic 3 model not found in plugin cache.\n` +
-    `Required location: ${ONNX_DIR}/\n` +
+function missingModelError(c?: CacheStatus): string {
+  const base = `Supertonic 3 model not found or incomplete in plugin cache.\n` +
+    `Required location: ${ONNX_DIR}/\n`;
+  if (c) {
+    const missing = MODEL_FILES.filter((f) => !c.files[f]?.exists).map((f) => `  - ${f}`);
+    const broken = MODEL_FILES.filter((f) => c.files[f]?.exists && c.files[f]!.size < 1000).map((f) => `  - ${f} (${c.files[f]!.size} bytes — likely download error)`);
+    return base +
+      (missing.length ? `\nMissing:\n${missing.join("\n")}` : "") +
+      (broken.length ? `\nCorrupt:\n${broken.join("\n")}` : "") +
+      `\n\nDownload from: https://huggingface.co/Supertone/supertonic-3/tree/main/onnx\n` +
+      `Or set PI_VOICE_ONLINE=1 to allow auto-download.`;
+  }
+  return base +
     `Required files: ${MODEL_FILES.join(", ")}\n\n` +
     `Download from: https://huggingface.co/Supertone/supertonic-3/tree/main/onnx\n` +
-    `Or set PI_VOICE_ONLINE=1 to allow auto-download.`
-  );
+    `Or set PI_VOICE_ONLINE=1 to allow auto-download.`;
 }
 
 // ─── Audio playback ───────────────────────────────────────────────────────
@@ -180,7 +188,7 @@ export default function (pi: ExtensionAPI) {
       await ensureCacheDir();
       const cache = await isCacheComplete();
       if (!cache.complete) {
-        throw new Error(missingModelError());
+        throw new Error(missingModelError(cache));
       }
 
       onUpdate?.("Loading model (warm: <500ms)…", 30);
