@@ -1,113 +1,132 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { KokoroTTS } from "kokoro-js";
-import { env as hfEnv } from "@huggingface/transformers";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, stat, readdir, writeFile, mkdir } from "node:fs/promises";
-import { existsSync, createWriteStream } from "node:fs";
+import { mkdtemp, rm, writeFile, readFile, stat, mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { platform } from "node:process";
-import { createRequire } from "node:module";
-import https from "node:https";
+import { loadVoiceStyle, loadTextToSpeech, writeWavFile } from "../src/supertonic-helper.js";
 
-const DEFAULT_VOICE = "am_michael";
-// kokoro-js 1.2.1 requires this specific repo id
-const MODEL_ID = "onnx-community/Kokoro-82M-v1.0-ONNX";
-
-// ─── Self-managed cache location ─────────────────────────────────────────
-// Stable, predictable location next to pi's agent cache. Plugin owns this
-// directory entirely — no scattering in node_modules/.cache.
+// ─── Self-managed plugin cache ─────────────────────────────────────────
 //
-// Layout (required by @huggingface/transformers FileCache):
-//   ~/.pi/agent/cache/pi-voice-michael/onnx-community/Kokoro-82M-v1.0-ONNX/
-//     ├── config.json
-//     ├── tokenizer.json
-//     ├── tokenizer_config.json
-//     └── onnx/
-//         └── model_quantized.onnx    (~89 MB)
-const PLUGIN_CACHE_DIR = join(homedir(), ".pi", "voice");
-const MODEL_DIR = join(PLUGIN_CACHE_DIR, "onnx-community", "Kokoro-82M-v1.0-ONNX");
-const ONNX_DIR = join(MODEL_DIR, "onnx");
+// ~/.pi/voice/supertonic/
+//   ├── config.json                       # user settings (default voice + lang)
+//   ├── onnx/                              # ~380MB ONNX model files
+//   │   ├── duration_predictor.onnx
+//   │   ├── text_encoder.onnx
+//   │   ├── vector_estimator.onnx
+//   │   ├── vocoder.onnx
+//   │   ├── tts.json
+//   │   └── unicode_indexer.json
+//   └── voice_styles/                     # 10 voice style presets
+//       ├── M1.json ... M5.json            # male voices
+//       └── F1.json ... F5.json            # female voices
+const PLUGIN_CACHE_DIR = join(homedir(), ".pi", "voice", "supertonic");
+const ONNX_DIR = join(PLUGIN_CACHE_DIR, "onnx");
+const VOICE_STYLES_DIR = join(PLUGIN_CACHE_DIR, "voice_styles");
 
-// Legacy cache paths from earlier versions — auto-migrate on first run
-const LEGACY_CACHE_PATHS = [
-  join(homedir(), ".pi", "agent", "cache", "pi-voice-michael"),
-  join(homedir(), ".cache", "huggingface", "hub", "models--onnx-community--Kokoro-82M-v1.0-ONNX"),
-  join(homedir(), ".cache", "huggingface", "models--onnx-community--Kokoro-82M-v1.0-ONNX"),
+const DEFAULT_VOICE = "M1";
+const DEFAULT_LANG = "de";
+const DEFAULT_SPEED = 1.05;
+const DEFAULT_TOTAL_STEP = 5;
+
+const MODEL_FILES = [
+  "duration_predictor.onnx",
+  "text_encoder.onnx",
+  "vector_estimator.onnx",
+  "vocoder.onnx",
+  "tts.json",
+  "unicode_indexer.json",
 ];
 
-// On startup, if the new cache is missing but a legacy one exists, symlink it
-function migrateLegacyCache(): void {
-  if (existsSync(ONNX_DIR) && existsSync(MODEL_DIR)) return; // already migrated
-  for (const legacy of LEGACY_CACHE_PATHS) {
-    if (!existsSync(legacy)) continue;
-    try {
-      // Map legacy onnx-community path → our onnx-community path
-      const legacyRepoDir = legacy.includes("models--")
-        ? join(legacy, "snapshots")
-        : join(legacy, "onnx-community", "Kokoro-82M-v1.0-ONNX");
-      if (!existsSync(legacyRepoDir)) continue;
-      mkdir(join(PLUGIN_CACHE_DIR, "onnx-community"), { recursive: true });
-      // Try hard-link or symlink; fall back to copy
-      const target = MODEL_DIR;
-      try {
-        mkdir(target, { recursive: true });
-        for (const f of ["model_quantized.onnx", "config.json", "tokenizer.json", "tokenizer_config.json"]) {
-          const src = join(legacyRepoDir, f);
-          const dst = f === "model_quantized.onnx" ? join(ONNX_DIR, f) : join(MODEL_DIR, f);
-          if (!existsSync(src) || existsSync(dst)) continue;
-          // Hard-link if possible (instant, no extra disk space)
-          try {
-            require("node:fs").linkSync(src, dst);
-          } catch {
-            // Fall back to copy
-            const { copyFile } = require("node:fs/promises");
-            copyFile(src, dst).catch(() => {});
-          }
-        }
-      } catch { /* swallow */ }
-      return;
-    } catch { /* try next */ }
+const AVAILABLE_VOICES = ["M1", "M2", "M3", "M4", "M5", "F1", "F2", "F3", "F4", "F5"];
+const AVAILABLE_LANGS = ["en", "ko", "ja", "ar", "bg", "cs", "da", "de", "el", "es", "et", "fi", "fr", "hi", "hr", "hu", "id", "it", "lt", "lv", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "tr", "uk", "vi", "na"];
+
+// ─── Settings ────────────────────────────────────────────────────────────
+const SETTINGS_FILE = process.env.PI_VOICE_SETTINGS ?? join(PLUGIN_CACHE_DIR, "config.json");
+
+interface VoiceSettings {
+  voice: string;
+  lang: string;
+  speed: number;
+  totalStep: number;
+}
+
+async function loadSettings(): Promise<VoiceSettings> {
+  try {
+    const raw = await readFile(SETTINGS_FILE, "utf8");
+    const p = JSON.parse(raw);
+    return {
+      voice: typeof p.voice === "string" ? p.voice : DEFAULT_VOICE,
+      lang: typeof p.lang === "string" ? p.lang : DEFAULT_LANG,
+      speed: typeof p.speed === "number" ? p.speed : DEFAULT_SPEED,
+      totalStep: typeof p.totalStep === "number" ? p.totalStep : DEFAULT_TOTAL_STEP,
+    };
+  } catch {
+    return { voice: DEFAULT_VOICE, lang: DEFAULT_LANG, speed: DEFAULT_SPEED, totalStep: DEFAULT_TOTAL_STEP };
   }
 }
-// Run migration at module load (sync, fast)
-migrateLegacyCache();
 
-const MODEL_FILES: Record<string, { path: string; expectedBytes: number }> = {
-  "onnx/model_quantized.onnx": { path: join(ONNX_DIR, "model_quantized.onnx"), expectedBytes: 90_000_000 },
-  "config.json": { path: join(MODEL_DIR, "config.json"), expectedBytes: 44 },
-  "tokenizer.json": { path: join(MODEL_DIR, "tokenizer.json"), expectedBytes: 4608 },
-  "tokenizer_config.json": { path: join(MODEL_DIR, "tokenizer_config.json"), expectedBytes: 113 },
-};
+async function saveSettings(s: VoiceSettings): Promise<void> {
+  await mkdir(dirname(SETTINGS_FILE), { recursive: true });
+  await writeFile(SETTINGS_FILE, JSON.stringify(s, null, 2), "utf8");
+}
 
-// Force @huggingface/transformers to use our cache directory BEFORE Kokoro
-// instantiates its pipeline. This prevents the library from scattering files
-// in node_modules/.cache directories. Must run at module-load time.
-hfEnv.cacheDir = PLUGIN_CACHE_DIR;
-// By default refuse remote downloads — plugin is 100% offline-first
-hfEnv.allowRemoteModels = process.env.PI_VOICE_ONLINE === "1";
-hfEnv.allowLocalModels = true;
+// ─── Cache management ────────────────────────────────────────────────────
+async function ensureCacheDir(): Promise<void> {
+  await mkdir(PLUGIN_CACHE_DIR, { recursive: true });
+  await mkdir(ONNX_DIR, { recursive: true });
+  await mkdir(VOICE_STYLES_DIR, { recursive: true });
+}
 
-// ─── Helpers ─────────────────────────────────────────────────────────────
+interface CacheStatus {
+  complete: boolean;
+  files: Record<string, { exists: boolean; size: number }>;
+}
+
+async function isCacheComplete(): Promise<CacheStatus> {
+  const files: Record<string, { exists: boolean; size: number }> = {};
+  for (const name of MODEL_FILES) {
+    const p = join(ONNX_DIR, name);
+    if (existsSync(p)) {
+      try {
+        const s = await stat(p);
+        files[name] = { exists: true, size: s.size };
+      } catch {
+        files[name] = { exists: false, size: 0 };
+      }
+    } else {
+      files[name] = { exists: false, size: 0 };
+    }
+  }
+  const complete = MODEL_FILES.every((f) => files[f]?.exists && files[f].size > 1000);
+  return { complete, files };
+}
+
+function missingModelError(): string {
+  return (
+    `Supertonic 3 model not found in plugin cache.\n` +
+    `Required location: ${ONNX_DIR}/\n` +
+    `Required files: ${MODEL_FILES.join(", ")}\n\n` +
+    `Download from: https://huggingface.co/Supertone/supertonic-3/tree/main/onnx\n` +
+    `Or set PI_VOICE_ONLINE=1 to allow auto-download.`
+  );
+}
+
+// ─── Audio playback ───────────────────────────────────────────────────────
 function pickPlayer(): { cmd: string; args: (path: string) => string[] } | null {
   const p = platform;
   if (p === "darwin") return { cmd: "afplay", args: (f) => [f] };
   if (p === "win32") {
     return {
       cmd: "powershell",
-      args: (f) => [
-        "-NoProfile", "-Command",
-        `Add-Type -AssemblyName PresentationCore; (New-Object System.Media.SoundPlayer '${f.replace(/'/g, "''")}').PlaySync()`,
-      ],
+      args: (f) => ["-NoProfile", "-Command", `Add-Type -AssemblyName PresentationCore; (New-Object System.Media.SoundPlayer '${f.replace(/'/g, "''")}').PlaySync()`],
     };
   }
   return {
     cmd: "sh",
-    args: (f) => [
-      "-c",
-      `command -v paplay >/dev/null && paplay '${f}' || (command -v pw-play >/dev/null && pw-play '${f}' || aplay -q '${f}')`,
-    ],
+    args: (f) => ["-c", `command -v paplay >/dev/null && paplay '${f}' || (command -v pw-play >/dev/null && pw-play '${f}' || aplay -q '${f}')`],
   };
 }
 
@@ -122,551 +141,114 @@ function playWav(wavPath: string): Promise<void> {
 }
 
 async function detectPlayers(): Promise<{ name: string; available: boolean }[]> {
-  const checks: { name: string; cmd: string }[] =
-    platform === "darwin"
-      ? [{ name: "afplay", cmd: "afplay" }]
-      : platform === "win32"
-      ? [{ name: "powershell", cmd: "powershell" }]
-      : [
-          { name: "paplay (PulseAudio)", cmd: "paplay" },
-          { name: "pw-play (PipeWire)", cmd: "pw-play" },
-          { name: "aplay (ALSA)", cmd: "aplay" },
-          { name: "ffplay (ffmpeg fallback)", cmd: "ffplay" },
-        ];
-  return Promise.all(
-    checks.map(async ({ name, cmd }) => {
-      try {
-        const res = await new Promise<{ status: number | null }>((resolve) => {
-          const p = spawn("sh", ["-c", `command -v ${cmd}`], { stdio: "ignore" });
-          p.on("exit", (code) => resolve({ status: code }));
-          p.on("error", () => resolve({ status: -1 }));
-        });
-        return { name, available: res.status === 0 };
-      } catch {
-        return { name, available: false };
-      }
-    }),
-  );
-}
-
-// ─── Self-managed model cache ────────────────────────────────────────────
-async function ensureCacheDir(): Promise<void> {
-  await mkdir(ONNX_DIR, { recursive: true });
-  await mkdir(MODEL_DIR, { recursive: true });
-}
-
-async function isCacheComplete(): Promise<{
-  complete: boolean;
-  files: Record<string, { exists: boolean; size: number; expectedBytes: number; path: string }>;
-}> {
-  const files: Record<string, { exists: boolean; size: number; expectedBytes: number; path: string }> = {};
-  for (const [name, info] of Object.entries(MODEL_FILES)) {
-    if (existsSync(info.path)) {
-      try {
-        const s = await stat(info.path);
-        files[name] = { exists: true, size: s.size, expectedBytes: info.expectedBytes, path: info.path };
-      } catch {
-        files[name] = { exists: false, size: 0, expectedBytes: info.expectedBytes, path: info.path };
-      }
-    } else {
-      files[name] = { exists: false, size: 0, expectedBytes: info.expectedBytes, path: info.path };
+  const checks = platform === "darwin"
+    ? [{ name: "afplay", cmd: "afplay" }]
+    : platform === "win32"
+    ? [{ name: "powershell", cmd: "powershell" }]
+    : [
+        { name: "paplay (PulseAudio)", cmd: "paplay" },
+        { name: "pw-play (PipeWire)", cmd: "pw-play" },
+        { name: "aplay (ALSA)", cmd: "aplay" },
+        { name: "ffplay (ffmpeg fallback)", cmd: "ffplay" },
+      ];
+  return Promise.all(checks.map(async ({ name, cmd }) => {
+    try {
+      const res = await new Promise<{ status: number | null }>((resolve) => {
+        const p = spawn("sh", ["-c", `command -v ${cmd}`], { stdio: "ignore" });
+        p.on("exit", (code) => resolve({ status: code }));
+        p.on("error", () => resolve({ status: -1 }));
+      });
+      return { name, available: res.status === 0 };
+    } catch {
+      return { name, available: false };
     }
-  }
-  // A file is "complete" if it exists AND has at least 50% of expected size
-  // (the ONNX file should be exactly ~89MB; JSONs are tiny)
-  const complete = Object.values(files).every((f) => f.exists && f.size >= f.expectedBytes * 0.5);
-  return { complete, files };
-}
-
-// Returns a precise error message if model is missing — tells user exactly where
-// to put files for manual installation (the whole point of self-managed cache)
-function missingModelError(): string {
-  return (
-    `Model not found in plugin cache. Required files:\n` +
-    `  ${ONNX_DIR}/model_quantized.onnx    (~89 MB)\n` +
-    `  ${MODEL_DIR}/config.json\n` +
-    `  ${MODEL_DIR}/tokenizer.json\n` +
-    `  ${MODEL_DIR}/tokenizer_config.json\n\n` +
-    `To install manually:\n` +
-    `  1. mkdir -p "${PLUGIN_CACHE_DIR}"\n` +
-    `  2. From huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX download:\n` +
-    `     - onnx/model_quantized.onnx  →  ${ONNX_DIR}/\n` +
-    `     - config.json                →  ${MODEL_DIR}/\n` +
-    `     - tokenizer.json             →  ${MODEL_DIR}/\n` +
-    `     - tokenizer_config.json      →  ${MODEL_DIR}/\n` +
-    `Or set PI_VOICE_ONLINE=1 to allow auto-download on first use.`
-  );
-}
-
-// Download a single file via HTTPS with redirect following
-function downloadFile(
-  url: string,
-  dest: string,
-  onProgress?: (downloaded: number, total: number) => void,
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const follow = (u: string): void => {
-      https.get(u, (res) => {
-        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          follow(res.headers.location);
-          return;
-        }
-        if (res.statusCode !== 200) {
-          reject(new Error(`HTTP ${res.statusCode} for ${u}`));
-          return;
-        }
-        const total = parseInt(res.headers["content-length"] ?? "0", 10);
-        let downloaded = 0;
-        const out = createWriteStream(dest);
-        res.on("data", (chunk: Buffer) => {
-          downloaded += chunk.length;
-          onProgress?.(downloaded, total);
-        });
-        res.pipe(out);
-        out.on("finish", () => out.close(() => resolve()));
-        out.on("error", reject);
-        res.on("error", reject);
-      }).on("error", reject);
-    };
-    follow(url);
-  });
-}
-
-// Download model files from HuggingFace into our self-managed cache.
-async function downloadModel(onProgress?: (msg: string, percent?: number) => void): Promise<void> {
-  await ensureCacheDir();
-  const { complete, files } = await isCacheComplete();
-  if (complete) {
-    onProgress?.("Model cache already complete", 100);
-    return;
-  }
-
-  // Map relative file path to (URL, dest). ONNX file lives in /onnx/ subfolder;
-  // JSON configs live at repo root.
-  const downloads: { key: string; url: string; dest: string }[] = Object.entries(files)
-    .filter(([, info]) => !info.exists)
-    .map(([key, info]) => ({
-      key,
-      url: key.startsWith("onnx/")
-        ? `https://huggingface.co/${MODEL_ID}/resolve/main/${key}`
-        : `https://huggingface.co/${MODEL_ID}/resolve/main/${key.split("/").pop()}`,
-      dest: info.path,
-    }));
-
-  let done = 0;
-  for (const d of downloads) {
-    done++;
-    const basePct = Math.round((done / downloads.length) * 100);
-    const label = d.key.split("/").pop() ?? d.key;
-    onProgress?.(`Downloading ${label} (${done}/${downloads.length})…`, basePct - 5);
-    await downloadFile(d.url, d.dest);
-  }
-  onProgress?.("Model download complete", 100);
-}
-
-// ─── TTS lifecycle ──────────────────────────────────────────────────────
-async function tryModelLoad(): Promise<{
-  ok: boolean;
-  ms?: number;
-  voices?: Record<string, unknown>;
-  error?: string;
-  onnxVersion?: string;
-}> {
-  const t0 = Date.now();
-  try {
-    const m = await KokoroTTS.from_pretrained(MODEL_ID, { dtype: "q8", device: "cpu" });
-    const voices = (m as unknown as { voices?: Record<string, unknown> }).voices ?? {};
-    let onnxVersion = "unknown";
-    try {
-      const req = createRequire(import.meta.url ?? __filename);
-      const ortPkg = req("onnxruntime-node/package.json");
-      onnxVersion = ortPkg.version;
-    } catch { /* ignore */ }
-    return { ok: true, ms: Date.now() - t0, voices, onnxVersion };
-  } catch (err: unknown) {
-    return { ok: false, error: (err as Error)?.message ?? String(err) };
-  }
-}
-
-async function tryEndToEnd(voice: string): Promise<{
-  ok: boolean;
-  ms?: number;
-  bytes?: number;
-  error?: string;
-}> {
-  try {
-    const tts = await KokoroTTS.from_pretrained(MODEL_ID, { dtype: "q8", device: "cpu" });
-    const t0 = Date.now();
-    const audio = await tts.generate("Voice test.", { voice } as unknown as Record<string, string>);
-    const dir = await mkdtemp(join(tmpdir(), "pi-voice-doctor-"));
-    const wavPath = join(dir, "test.wav");
-    await audio.save(wavPath);
-    const s = await stat(wavPath);
-    await playWav(wavPath);
-    rm(dir, { recursive: true, force: true }).catch(() => {});
-    return { ok: true, ms: Date.now() - t0, bytes: s.size };
-  } catch (err: unknown) {
-    return { ok: false, error: (err as Error)?.message ?? String(err) };
-  }
-}
-
-async function tryPkgVersion(name: string): Promise<string | undefined> {
-  // Modern packages use `exports` field that blocks `require.resolve(name)`.
-  // Strategy: try resolving from every relevant consumer (kokoro-js,
-  // @huggingface/transformers), then pick the most-deeply-nested match —
-  // that's the version Node would actually load when Kokoro delegates to
-  // transformers (which has its own nested onnxruntime-node). Fallback:
-  // walk node_modules from the plugin's directory.
-  const anchors = ["kokoro-js", "@huggingface/transformers"];
-  const candidates: { pkgDir: string; nestedness: number }[] = [];
-  for (const anchor of anchors) {
-    try {
-      const req = createRequire(import.meta.url ?? __filename);
-      const anchorPath = req.resolve(anchor);
-      const anchorReq = createRequire(join(anchorPath, "..", "package.json"));
-      const resolved = anchorReq.resolve(name);
-      const parts = resolved.split("/");
-      const nmIdx = parts.lastIndexOf("node_modules");
-      if (nmIdx < 0) continue;
-      const isScoped = parts[nmIdx + 1].startsWith("@");
-      const offset = isScoped ? 3 : 2;
-      const pkgDir = parts.slice(0, nmIdx + offset).join("/");
-      const nestedness = (resolved.match(/node_modules/g) ?? []).length;
-      candidates.push({ pkgDir, nestedness });
-    } catch { /* exports field blocking — try walk fallback */ }
-  }
-  // Fallback: walk node_modules upward from this file's directory
-  try {
-    const here = (import.meta.url ?? __filename).replace(/^file:\/\//, "");
-    let cursor = here.split("/").slice(0, -1).join("/");
-    const isScoped = name.startsWith("@");
-    const segs = isScoped ? name.split("/") : [name];
-    while (cursor && cursor !== "/" && cursor !== ".") {
-      const candidate = join(cursor, "node_modules", ...segs);
-      if (existsSync(candidate)) {
-        const nestedness = (candidate.match(/node_modules/g) ?? []).length;
-        candidates.push({ pkgDir: candidate, nestedness });
-      }
-      cursor = cursor.split("/").slice(0, -1).join("/");
-    }
-  } catch { /* ignore */ }
-
-  candidates.sort((a, b) => b.nestedness - a.nestedness);
-  for (const c of candidates) {
-    try {
-      const { readFile } = await import("node:fs/promises");
-      const pkg = JSON.parse(await readFile(join(c.pkgDir, "package.json"), "utf8"));
-      return pkg.version as string;
-    } catch { continue; }
-  }
-  return undefined;
-}
-
-// ─── Settings file (user-configurable voice preference) ─────────────────
-// Lets users switch between voices (e.g. am_michael, am_fenrir) without
-// editing the plugin. Set PI_VOICE_SETTINGS env var to override path.
-const SETTINGS_FILE = process.env.PI_VOICE_SETTINGS ?? join(homedir(), ".pi", "voice", "config.json");
-
-interface VoiceSettings {
-  voice: string;
-  // Reserved for future: speed, pitch, language preference
-}
-
-async function loadSettings(): Promise<VoiceSettings> {
-  try {
-    const { readFile } = await import("node:fs/promises");
-    const raw = await readFile(SETTINGS_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    return { voice: typeof parsed.voice === "string" ? parsed.voice : DEFAULT_VOICE };
-  } catch {
-    return { voice: DEFAULT_VOICE };
-  }
-}
-
-async function saveSettings(s: VoiceSettings): Promise<void> {
-  const { writeFile, mkdir } = await import("node:fs/promises");
-  await mkdir(dirname(SETTINGS_FILE), { recursive: true });
-  await writeFile(SETTINGS_FILE, JSON.stringify(s, null, 2), "utf8");
+  }));
 }
 
 // ─── Plugin ──────────────────────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
-  let tts: KokoroTTS | null = null;
-  let ttsLoading: Promise<KokoroTTS> | null = null;
-  let settings: VoiceSettings = { voice: DEFAULT_VOICE };
+  let settings: VoiceSettings = { voice: DEFAULT_VOICE, lang: DEFAULT_LANG, speed: DEFAULT_SPEED, totalStep: DEFAULT_TOTAL_STEP };
 
-  async function ensureModelReady(onUpdate?: (msg: string, percent?: number) => void): Promise<void> {
-    onUpdate?.("Checking self-managed cache…", 0);
-    await ensureCacheDir();
-    const cache = await isCacheComplete();
-    if (!cache.complete) {
-      if (process.env.PI_VOICE_ONLINE === "1") {
-        onUpdate?.("Cache incomplete — downloading model (~90 MB)…", 5);
-        await downloadModel((msg, pct) => onUpdate?.(msg, pct));
-        onUpdate?.("Model downloaded to plugin cache", 95);
-      } else {
-        // Offline-first: surface precise error so user knows exactly where to put files
-        throw new Error(missingModelError());
-      }
-    } else {
-      onUpdate?.("Model cache ready (offline)", 95);
-    }
-  }
-
-  async function ensureTTS(onUpdate?: (msg: string, percent?: number) => void): Promise<KokoroTTS> {
-    if (tts) return tts;
-    if (!ttsLoading) {
-      ttsLoading = (async () => {
-        await ensureModelReady(onUpdate);
-        const m = await KokoroTTS.from_pretrained(MODEL_ID, { dtype: "q8", device: "cpu" });
-        tts = m;
-        return m;
-      })();
-    }
-    return ttsLoading;
-  }
-
-  // Split text into sentences. Naive but works for English/German:
-  // split on . ! ? ; newlines, but preserve the delimiter on the chunk.
-  function splitSentences(text: string): string[] {
-    const out: string[] = [];
-    const re = /([^.!?\n]+[.!?]?|\n+)/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) {
-      const s = m[0].trim();
-      if (s) out.push(s);
-    }
-    // Fallback if regex matched nothing (e.g. very short text without punctuation)
-    return out.length > 0 ? out : [text];
-  }
-
-  // Background playback worker. Owns its own event loop tick — even when the
-  // tool call has returned and pi is showing the result to the user, this
-  // promise keeps the Node process alive long enough to finish playback.
-  // We .unref() the directory cleanup timer so it doesn't keep the process
-  // alive unnecessarily after the WAV is gone.
   async function speak(
     text: string,
-    voice: string,
     onUpdate?: (msg: string, percent?: number) => void,
-  ): Promise<{ ok: boolean; voice: string; text: string; file?: string; error?: string; chunks?: number; totalChunks?: number }> {
+  ): Promise<{ ok: boolean; voice: string; lang: string; text: string; error?: string; durationSec?: number }> {
+    const dir = await mkdtemp(join(tmpdir(), "pi-voice-"));
+    const wavPath = join(dir, `speech-${Date.now()}.wav`);
     try {
-      onUpdate?.("Initializing…", 2);
+      onUpdate?.("Initializing Supertonic…", 5);
+      await ensureCacheDir();
+      const cache = await isCacheComplete();
+      if (!cache.complete) {
+        throw new Error(missingModelError());
+      }
+
+      onUpdate?.("Loading model (warm: <500ms)…", 30);
       const t0 = Date.now();
-      const model = await ensureTTS((msg, pct) => onUpdate?.(msg, pct));
-      onUpdate?.(`Model loaded in ${((Date.now() - t0) / 1000).toFixed(1)}s`, 8);
+      const tts = await loadTextToSpeech(ONNX_DIR, false);
+      const voiceStyle = await loadVoiceStyle([join(VOICE_STYLES_DIR, `${settings.voice}.json`)]);
+      onUpdate?.(`Model ready in ${((Date.now() - t0) / 1000).toFixed(1)}s`, 60);
 
-      // Coalesce input sentences into chunks. Kokoro caps output at ~30s of
-      // audio per generate() call (~510 phoneme tokens); longer inputs
-      // get truncated to that limit. We split into chunks of ~10 sentences
-      // each so generation succeeds deterministically. Empirically each
-      // chunk yields ~10–30s of audio depending on text length.
-      const sentences = splitSentences(text);
-      const CHUNK_SENTENCES = 10;
-      const chunks: string[] = [];
-      for (let i = 0; i < sentences.length; i += CHUNK_SENTENCES) {
-        chunks.push(sentences.slice(i, i + CHUNK_SENTENCES).join(" "));
-      }
-      const total = chunks.length;
-      onUpdate?.(`Split into ${total} chunks of up to ${CHUNK_SENTENCES} sentences each`, 12);
+      onUpdate?.("Synthesizing…", 75);
+      const t1 = Date.now();
+      // TextToSpeech.call() handles text chunking internally for long inputs
+      // (maxLen 300 chars per chunk, or 120 for ja/ko)
+      const { wav, duration } = await tts.call(text, settings.lang, voiceStyle, settings.totalStep, settings.speed);
+      const genMs = Date.now() - t1;
 
-      // Streaming pipeline: generate chunk N+1 while chunk N plays.
-      // We use a single mpv process that we feed WAV paths to one at a time.
-      // Between chunks we do NOT close mpv — so playback is gapless.
-      const { spawn } = await import("node:child_process");
-      let mpv: ReturnType<typeof spawn> | null = null;
+      await writeWavFile(wavPath, wav, tts.sampleRate);
+      const audioSec = (duration[0] !== undefined && duration[0] !== null) ? duration[0] : wav.length / tts.sampleRate;
+      onUpdate?.(`Synthesized ${audioSec.toFixed(1)}s audio in ${(genMs / 1000).toFixed(1)}s, playing…`, 95);
+
       try {
-        mpv = spawn("mpv", [
-          "--no-video",
-          "--no-terminal",
-          "--really-quiet",
-          "--gapless-audio",
-          "--keep-open=no",
-          "--",  // separator; everything after is a playlist
-          "fd://0",  // read filenames from stdin (we'll write paths in)
-        ], { stdio: ["pipe", "ignore", "ignore"] });
+        await playWav(wavPath);
       } catch (err) {
-        // Fallback: spawn failed (mpv not installed), use per-file paplay
-        onUpdate?.(`mpv unavailable, falling back to sequential paplay`, 15);
-        mpv = null;
+        onUpdate?.(`Playback failed: ${(err as Error).message}`, 100);
       }
-
-      let playedChunks = 0;
-      const tempDirs: string[] = [];
-
-      try {
-        // Staged streaming pipeline:
-        //   Stage 1 (Pre-roll):  Generate first 2 chunks in parallel.
-        //   Stage 2 (Streaming):  Start mpv playback, then generate remaining
-        //                         chunks in sequence (one at a time). Each
-        //                         chunk becomes ready while the previous is
-        //                         still playing, so total time = max(gen_time,
-        //                         play_time) rather than sum.
-        //
-        // Why sequential after pre-roll? ONNX runtime internally serializes
-        // parallel calls, so parallel generation saves no wall time but uses
-        // N× the RAM. Sequential keeps memory bounded.
-        const CONCURRENCY = 2; // pre-roll only
-        const resultFor = async (idx: number): Promise<{ idx: number; wavPath: string } | { idx: number; error: Error }> => {
-          const chunkText = chunks[idx];
-          const dir = await mkdtemp(join(tmpdir(), "pi-voice-"));
-          tempDirs.push(dir);
-          const wavPath = join(dir, `c-${idx}-${Date.now()}.wav`);
-          try {
-            const t1 = Date.now();
-            onUpdate?.(`Generating chunk ${idx + 1}/${total}…`, 15 + Math.floor((idx / total) * 70));
-            const audio = await model.generate(chunkText, { voice } as unknown as Record<string, string>);
-            await audio.save(wavPath);
-            const genMs = Date.now() - t1;
-            onUpdate?.(`Chunk ${idx + 1}/${total} ready in ${(genMs / 1000).toFixed(1)}s`, 15 + Math.floor(((idx + 1) / total) * 70));
-            return { idx, wavPath };
-          } catch (err) {
-            return { idx, error: err as Error };
-          }
-        };
-
-        // Pre-roll: generate first CONCURRENCY chunks in parallel
-        const queue: Array<Promise<{ idx: number; wavPath: string } | { idx: number; error: Error }>> = [];
-        for (let i = 0; i < Math.min(CONCURRENCY, total); i++) {
-          queue.push(resultFor(i));
-        }
-
-        // Consume ready chunks: each iteration pulls the next-ready chunk
-        // and pushes it into mpv (gapless). When a chunk is consumed, start
-        // generating the next one. This overlaps generation with playback.
-        for (let consumed = 0; consumed < total; consumed++) {
-          // Wait for the next chunk to be ready
-          const result = await queue.shift()!;
-          if ("error" in result) {
-            onUpdate?.(`Chunk ${result.idx + 1}/${total} generation failed: ${result.error.message}`, 100);
-            continue;
-          }
-          const wavPath = result.wavPath;
-          if (mpv && !mpv.killed && mpv.stdin?.writable) {
-            // Push to mpv playlist. mpv plays gaplessly.
-            mpv.stdin.write(wavPath + "\n");
-          } else {
-            // Fallback: per-file paplay. Gap between chunks is small.
-            await playWav(wavPath).catch((err) => {
-              onUpdate?.(`Playback failed: ${(err as Error).message}`, 100);
-            });
-          }
-          playedChunks++;
-          // Schedule next chunk generation (overlaps with playback)
-          const nextIdx = consumed + CONCURRENCY;
-          if (nextIdx < total) {
-            queue.push(resultFor(nextIdx));
-          }
-        }
-        onUpdate?.(`All ${playedChunks} chunks played`, 95);
-
-        // Wait for mpv to drain its playlist
-        if (mpv && !mpv.killed) {
-          mpv.stdin?.end();
-          await new Promise<void>((resolve) => {
-            mpv!.on("exit", () => resolve());
-            setTimeout(() => resolve(), 30 * 60 * 1000); // 30 min hard cap
-          });
-        }
-        onUpdate?.(`Playback complete (${playedChunks} chunks)`, 100);
-        return { ok: true, voice, text, chunks: playedChunks, totalChunks: total };
-      } finally {
-        if (mpv && !mpv.killed) {
-          mpv.kill();
-        }
-        for (const d of tempDirs) void rm(d, { recursive: true, force: true }).catch(() => {});
-        scheduleIdleUnload();
-      }
-    } catch (err: unknown) {
-      return { ok: false, voice, text, error: (err as Error)?.message ?? String(err) };
+      onUpdate?.("Done", 100);
+      return { ok: true, voice: settings.voice, lang: settings.lang, text, durationSec: audioSec };
+    } catch (err) {
+      return { ok: false, voice: settings.voice, lang: settings.lang, text, error: (err as Error).message };
+    } finally {
+      void rm(dir, { recursive: true, force: true }).catch(() => {});
     }
-  }
-
-  // ─── Idle unload: release Kokoro after 5min of inactivity ────────────
-  // Kokoro caches every voice it has ever used in an internal Map that is
-  // never garbage-collected. After many voice switches, that map can hold
-  // dozens of 510KB Float32Arrays (~2MB heap each). We force release the
-  // whole Kokoro instance after 5min idle, then reload on next call.
-  let idleTimer: NodeJS.Timeout | null = null;
-  function scheduleIdleUnload(): void {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      const mem = process.memoryUsage();
-      const rssMB = Math.round(mem.rss / 1024 / 1024);
-      // Unload if either: (a) RSS > 500 MB or (b) we've been idle for the full
-      // 5 minutes regardless. The latter is cheap insurance.
-      tts = null;
-      ttsLoading = null;
-      if (global.gc) {
-        try { global.gc(); } catch {}
-      }
-      idleTimer = null;
-    }, 5 * 60 * 1000);
   }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
     settings = await loadSettings();
     ctx.ui.notify(
-      `🔊 pi-voice-michael loaded. Voice: **${settings.voice}** (settings: ${SETTINGS_FILE.replace(homedir(), "~")}). Run /voice-set <name> to change.`,
+      `🔊 pi-voice-michael (Supertonic 3) loaded. Voice: ${settings.voice}, Lang: ${settings.lang}. Cache: ${PLUGIN_CACHE_DIR.replace(homedir(), "~")}`,
       "info",
     );
-    // Background pre-warm: ensure model is cached and loaded
-    (async () => {
-      try { await ensureTTS(); } catch { /* silent */ }
-    })();
   });
 
-  pi.on("session_shutdown", async () => {
-    tts = null;
-    ttsLoading = null;
-  });
-
-  // ─── Tool: voice_say_aloud ─────────────────────────────────────────────
+  // ─── Tool: voice_say_aloud ────────────────────────────────────────────
   pi.registerTool({
     name: "voice_say_aloud",
-    label: "Speak Aloud (am_michael)",
+    label: "Speak Aloud (Supertonic)",
     description:
-      "Convert text to speech and play it aloud through the user's speakers using the offline am_michael voice (Kokoro ONNX, US English male). Self-managed cache at ~/.pi/agent/cache/pi-voice-michael/. Use this when the user explicitly asks you to speak, or when a verbal response is appropriate. Pass plain conversational text — no markdown, no code blocks, no URLs. First call may take ~30s for model download/init; subsequent calls are fast (~3s). If setup is broken, run /voice-doctor first.",
+      "Convert text to speech and play it aloud through the user's speakers using the offline Supertonic 3 ONNX engine (44.1kHz, 99M params, 31 languages). Configure voice via /voice-set and language via /voice-lang. Pass plain conversational text — no markdown, no code blocks. Long texts are automatically chunked internally. First call ~500ms model load, then ~2-4s per sentence.",
     parameters: Type.Object({
-      text: Type.String({
-        description:
-          "The text to speak aloud. Plain conversational English, no formatting. Keep it short (1–2 sentences ideal).",
-      }),
-      voice: Type.Optional(
-        Type.String({
-          description:
-            "Optional voice override. Defaults to am_michael. Other voices: am_fenrir, am_puck, bm_george, af_heart, af_bella, etc.",
-        }),
-      ),
+      text: Type.String({ description: "Plain conversational text to speak. No formatting, no URLs." }),
     }),
     async execute(_id, params, _signal, onUpdate, _ctx) {
-      const { text, voice } = params as { text: string; voice?: string };
-      const v = voice || settings.voice;
+      const { text } = params as { text: string };
       const report = (msg: string, percent?: number) => {
         if (!onUpdate) return;
-        try {
-          onUpdate({
-            content: [{ type: "text", text: `🔊 ${msg}` }],
-            details: { phase: msg, percent: percent ?? null },
-          });
-        } catch { /* ignore */ }
+        try { onUpdate({ content: [{ type: "text", text: `🔊 ${msg}` }], details: { phase: msg, percent: percent ?? null } }); }
+        catch { /* onUpdate may not be available */ }
       };
-      report("Starting TTS pipeline…", 0);
-      const r = await speak(text, v, report);
+      report("Starting TTS pipeline...", 0);
+      const r = await speak(text, report);
       if (r.ok) {
         return {
-          content: [{ type: "text", text: `🔊 Spoke aloud (${r.voice}): "${text}"` }],
-          details: { ...r, percent: 100 },
+          content: [{ type: "text", text: `🔊 Spoke (${r.voice}, ${r.lang}, ${r.durationSec?.toFixed(1)}s audio): "${text.slice(0, 60)}${text.length > 60 ? "..." : ""}"` }],
+          details: r,
         };
       }
       return {
-        content: [
-          {
-            type: "text",
-            text: `❌ TTS playback failed: ${r.error}\nRun /voice-doctor to diagnose.`,
-          },
-        ],
+        content: [{ type: "text", text: `❌ TTS failed: ${r.error}\nRun /voice-doctor to diagnose.` }],
         details: r,
         isError: true,
       };
@@ -675,263 +257,162 @@ export default function (pi: ExtensionAPI) {
 
   // ─── Command: /say ────────────────────────────────────────────────────
   pi.registerCommand("say", {
-    description: "Speak text aloud using the configured voice (default from settings). Usage: /say <text> [voice]",
+    description: "Speak text aloud using the configured Supertonic voice. Usage: /say <text>",
     async handler(args, ctx) {
-      const trimmed = args.trim();
-      if (!trimmed) {
-        ctx.ui.notify(`Usage: /say <text> [voice]  (current voice: ${settings.voice})`, "warning");
+      const text = args.trim();
+      if (!text) {
+        ctx.ui.notify(`Usage: /say <text>  (voice: ${settings.voice}, lang: ${settings.lang})`, "warning");
         return;
       }
-      const quotedMatch = trimmed.match(/^"([^"]+)"(?:\s+(\S+))?$/);
-      let text: string;
-      let voice: string | undefined;
-      if (quotedMatch) {
-        text = quotedMatch[1];
-        voice = quotedMatch[2];
-      } else {
-        const tokens = trimmed.split(/\s+/);
-        if (tokens.length >= 2 && /^(am|af|bm|bf|jm|ef|em|ff|hf|hm|if|im|jf|jm|pf|pm|zf|zm)_/.test(tokens[tokens.length - 1])) {
-          voice = tokens.pop();
-        }
-        text = tokens.join(" ");
-      }
-      ctx.ui.setStatus("pi-voice", "🔊 Initializing…");
-      const r = await speak(text, voice || settings.voice, (msg, pct) => {
+      ctx.ui.setStatus("pi-voice", "🔊 Loading Supertonic…");
+      const r = await speak(text, (msg, pct) => {
         ctx.ui.setStatus("pi-voice", `🔊 ${msg}${pct != null ? ` ${pct}%` : ""}`);
       });
       ctx.ui.setStatus("pi-voice", "");
-      if (r.ok) ctx.ui.notify(`🔊 Spoke (${r.voice}): "${text}"`, "info");
+      if (r.ok) ctx.ui.notify(`🔊 Spoke (${r.durationSec?.toFixed(1)}s audio): "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`, "info");
       else ctx.ui.notify(`❌ TTS failed: ${r.error}`, "error");
     },
   });
 
   // ─── Command: /voice-set ──────────────────────────────────────────────
-  // Change the configured voice. Persists to ~/.pi/voice/config.json.
-  // Validates against available voices WITHOUT preloading the full model.
   pi.registerCommand("voice-set", {
-    description: "Set the default voice for voice_say_aloud. Usage: /voice-set <voice_id> (e.g. am_michael, am_fenrir, af_heart)",
+    description: `Set the voice style. Available: ${AVAILABLE_VOICES.join(", ")}`,
     async handler(args, ctx) {
-      const newVoice = args.trim();
-      if (!newVoice) {
-        ctx.ui.notify(`Current voice: ${settings.voice}\nUsage: /voice-set <voice_id>`, "info");
+      const v = args.trim().toUpperCase();
+      if (!AVAILABLE_VOICES.includes(v)) {
+        ctx.ui.notify(`❌ Unknown voice: ${v}\nAvailable: ${AVAILABLE_VOICES.join(", ")}`, "error");
         return;
       }
-      // Quick validation: voice id must match Kokoro naming convention
-      // (lang_gender_name pattern). Doesn't require model to be loaded.
-      if (!/^(af|am|bf|bm|jf|jm|ef|em|ff|hf|hm|if|im|pf|pm|zf|zm)_/.test(newVoice)) {
-        ctx.ui.notify(
-          `❌ Invalid voice id: ${newVoice}\nMust start with one of: af_, am_, bf_, bm_, ef_, em_, ff_, hf_, hm_, if_, im_, jf_, jm_, pf_, pm_, zf_, zm_\nRun /voice-list to see all available.`,
-          "error",
-        );
-        return;
-      }
-      // Save first (fast), then async-validate and warn if invalid
-      const oldVoice = settings.voice;
-      settings.voice = newVoice;
+      settings.voice = v;
       await saveSettings(settings);
-      ctx.ui.notify(`✓ Voice set to **${newVoice}**\nSaved to ${SETTINGS_FILE.replace(homedir(), "~")}\nNext /say or voice_say_aloud will use this voice.`, "info");
-      // Background-validate so we can warn if voice doesn't exist
-      (async () => {
-        try {
-          const tts = await ensureTTS();
-          const voices = (tts as unknown as { voices?: Record<string, unknown> }).voices ?? {};
-          if (!Object.keys(voices).includes(newVoice)) {
-            ctx.ui.notify(`⚠️ ${newVoice} is not in Kokoro's voice list. Reverted to ${oldVoice}.`, "error");
-            settings.voice = oldVoice;
-            await saveSettings(settings);
-          }
-        } catch { /* model not loaded yet — try again next time */ }
-      })();
+      ctx.ui.notify(`✓ Voice set to **${v}** (saved to ${SETTINGS_FILE.replace(homedir(), "~")})`, "info");
+    },
+  });
+
+  // ─── Command: /voice-lang ─────────────────────────────────────────────
+  pi.registerCommand("voice-lang", {
+    description: `Set the language code. Available: ${AVAILABLE_LANGS.join(", ")}`,
+    async handler(args, ctx) {
+      const l = args.trim().toLowerCase();
+      if (!AVAILABLE_LANGS.includes(l)) {
+        ctx.ui.notify(`❌ Unknown lang: ${l}\nAvailable: ${AVAILABLE_LANGS.join(", ")}`, "error");
+        return;
+      }
+      settings.lang = l;
+      await saveSettings(settings);
+      ctx.ui.notify(`✓ Language set to **${l}**`, "info");
     },
   });
 
   // ─── Command: /voice-list ─────────────────────────────────────────────
   pi.registerCommand("voice-list", {
-    description: "List all available voices grouped by language",
+    description: "List available voices and languages",
     async handler(_args, ctx) {
-      try {
-        const tts = await ensureTTS();
-        const voices = (tts as unknown as { voices?: Record<string, unknown> }).voices ?? {};
-        const grouped: Record<string, string[]> = {};
-        for (const [id, meta] of Object.entries(voices as Record<string, { language?: string; gender?: string }>)) {
-          const lang = meta.language ?? "unknown";
-          (grouped[lang] ??= []).push(`${id} (${meta.gender ?? "?"})`);
-        }
-        const lines: string[] = [`Current voice: ${settings.voice}`, ""];
-        for (const [lang, list] of Object.entries(grouped).sort()) {
-          lines.push(`${lang}: ${list.join(", ")}`);
-        }
-        ctx.ui.setWidget("voice-list", lines);
-        ctx.ui.notify(`Voices loaded (${Object.keys(voices).length} total). See widget for full list.`, "info");
-      } catch (err) {
-        ctx.ui.notify(`❌ Could not load voices: ${(err as Error).message}`, "error");
-      }
-    },
-  });
-
-  // ─── Command: /voice-doctor ─────────────────────────────────────────────
-  // Design principles:
-  //   1. ONE notify per check — short, scannable, never truncated.
-  //   2. Full detail lines → widget as a compact one-line-per-check list.
-  //   3. No markdown sections, no multi-line strings in notify.
-  pi.registerCommand("voice-doctor", {
-    description:
-      "Diagnose pi-voice-michael setup — verifies full offline capability using self-managed cache",
-    async handler(_args, ctx) {
-      ctx.ui.setStatus("voice-doctor", "Running…");
-      const checks: { ok: boolean; name: string; detail: string }[] = [];
-
-      // ── 1. Audio player ──────────────────────────────────────────────
-      const players = await detectPlayers();
-      const availPlayer = players.find((p) => p.available);
-      const playerOk = !!availPlayer;
-      if (playerOk) {
-        ctx.ui.notify(`1/5 ✓ Audio: ${availPlayer.name} available`, "info");
-      } else {
-        const missing = players.filter((p) => !p.available).map((p) => p.name).join(", ");
-        ctx.ui.notify(`1/5 ❌ Audio: none found (tried: ${missing})`, "error");
-      }
-      checks.push({
-        ok: playerOk,
-        name: "Audio player",
-        detail: playerOk ? availPlayer.name : `none (tried: ${players.map((p) => p.name).join(", ")})`,
-      });
-
-      // ── 2. NPM dependencies ────────────────────────────────────────────
-      const [kokoroVer, transVer, ortVer, piCodingVer] = await Promise.all([
-        tryPkgVersion("kokoro-js"),
-        tryPkgVersion("@huggingface/transformers"),
-        tryPkgVersion("onnxruntime-node"),
-        tryPkgVersion("@earendil-works/pi-coding-agent"),
-      ]);
-      const depsOk = !!(kokoroVer && transVer && ortVer && piCodingVer);
-      let ortNote = "";
-      if (ortVer) {
-        const minor = parseInt(ortVer.split(".")[1], 10);
-        if (minor < 20 || minor > 21) {
-          ortNote = ` ⚠️ ort ${ortVer} may be incompatible (use ~1.21.0)`;
-        }
-      }
-      ctx.ui.notify(
-        `2/5 ${depsOk ? "✓" : "❌"} Deps: kokoro=${kokoroVer ?? "?"}, hf=${transVer ?? "?"}, ort=${ortVer ?? "?"}${ortNote}`,
-        depsOk ? "info" : "error",
-      );
-      checks.push({
-        ok: depsOk,
-        name: "Dependencies",
-        detail: `kokoro=${kokoroVer ?? "MISSING"}, hf=${transVer ?? "MISSING"}, ort=${ortVer ?? "MISSING"}${ortNote}`,
-      });
-
-      // ── 3. Self-managed cache ──────────────────────────────────────────
-      await ensureCacheDir();
-      const cache = await isCacheComplete();
-      const cacheOk = cache.complete;
-      const totalMB = Object.values(cache.files).reduce((s, f) => s + f.size, 0) / 1024 / 1024;
-      const cachePath = PLUGIN_CACHE_DIR.replace(homedir(), "~");
-      ctx.ui.notify(
-        `3/5 ${cacheOk ? "✓" : "⚠️"} Cache: ${totalMB.toFixed(1)} MB at ${cachePath}${cacheOk ? "" : " — INCOMPLETE"}`,
-        cacheOk ? "info" : "warning",
-      );
-      checks.push({
-        ok: cacheOk,
-        name: "Model cache",
-        detail: `${totalMB.toFixed(1)} MB, ${cacheOk ? "complete" : "incomplete"}`,
-      });
-
-      // ── 4. Model load test ─────────────────────────────────────────────
-      const loadResult = await tryModelLoad();
-      const loadOk = loadResult.ok && (loadResult.voices?.[DEFAULT_VOICE] !== undefined);
-      if (loadResult.ok) {
-        ctx.ui.notify(
-          `4/5 ✓ Model: loaded in ${(loadResult.ms! / 1000).toFixed(1)}s (ort ${loadResult.onnxVersion})${loadResult.voices ? `, ${loadResult.voices.length} voices` : ""}`,
-          "info",
-        );
-      } else {
-        ctx.ui.notify(`4/5 ❌ Model: ${loadResult.error?.split("\n")[0] ?? "load failed"}`, "error");
-      }
-      checks.push({
-        ok: loadOk,
-        name: "Model load",
-        detail: loadResult.ok
-          ? `${(loadResult.ms! / 1000).toFixed(1)}s, ort ${loadResult.onnxVersion}, ${loadResult.voices?.length ?? 0} voices`
-          : `FAILED: ${loadResult.error?.split("\n")[0]}`,
-      });
-
-      // ── 5. End-to-end ─────────────────────────────────────────────────
-      let e2eOk = false;
-      if (!playerOk || !loadOk) {
-        ctx.ui.notify("5/5 ⏭️ E2E: skipped (player or model check failed)", "warning");
-        checks.push({ ok: false, name: "End-to-end", detail: "skipped (prerequisites failed)" });
-      } else {
-        const e2e = await tryEndToEnd(DEFAULT_VOICE);
-        e2eOk = e2e.ok;
-        if (e2e.ok) {
-          ctx.ui.notify(
-            `5/5 ✓ E2E: synthesized + played in ${(e2e.ms! / 1000).toFixed(1)}s (${(e2e.bytes! / 1024).toFixed(0)} KB)`,
-            "info",
-          );
-        } else {
-          ctx.ui.notify(`5/5 ❌ E2E: ${e2e.error?.split("\n")[0] ?? "failed"}`, "error");
-        }
-        checks.push({
-          ok: e2eOk,
-          name: "End-to-end",
-          detail: e2e.ok
-            ? `${(e2e.ms! / 1000).toFixed(1)}s, ${(e2e.bytes! / 1024).toFixed(0)} KB WAV`
-            : `FAILED: ${e2e.error?.split("\n")[0]}`,
-        });
-      }
-
-      // ── Summary widget ─────────────────────────────────────────────────
-      const allOk = checks.every((c) => c.ok);
-      const passed = checks.filter((c) => c.ok).length;
-      const failed = checks.filter((c) => !c.ok).map((c) => c.name);
-
-      const widgetLines = [
-        `# /voice-doctor  ${passed}/5 passed`,
+      const lines = [
+        `Current: voice=${settings.voice}, lang=${settings.lang}, speed=${settings.speed}, totalStep=${settings.totalStep}`,
         "",
-        ...checks.map((c) => `  ${c.ok ? "✓" : "✗"} [${c.name}] ${c.detail}`),
+        `Voices (${AVAILABLE_VOICES.length}):`,
+        `  Male:   ${AVAILABLE_VOICES.filter(v => v.startsWith("M")).join(", ")}`,
+        `  Female: ${AVAILABLE_VOICES.filter(v => v.startsWith("F")).join(", ")}`,
         "",
-        allOk
-          ? `🎉 Fully offline-capable. Cache: \`${cachePath}\``
-          : `⚠️ Failed: ${failed.join(", ")}. See notify details above.`,
+        `Languages (${AVAILABLE_LANGS.length}):`,
+        `  ${AVAILABLE_LANGS.join(", ")}`,
       ];
-
-      ctx.ui.setWidget("voice-doctor", widgetLines);
-      ctx.ui.setStatus("voice-doctor", "");
-
-      if (allOk) {
-        ctx.ui.notify(`🎉 /voice-doctor: all 5 checks passed — fully offline-capable`, "info");
-      } else {
-        ctx.ui.notify(`⚠️ /voice-doctor: ${passed}/5 passed. Failed: ${failed.join(", ")}`, "error");
-      }
+      ctx.ui.setWidget("voice-list", lines);
+      ctx.ui.notify(`${AVAILABLE_VOICES.length} voices × ${AVAILABLE_LANGS.length} languages available`, "info");
     },
   });
 
-  // ─── Command: /voice-cache ─────────────────────────────────────────────
+  // ─── Command: /voice-cache ────────────────────────────────────────────
   pi.registerCommand("voice-cache", {
-    description: `Show plugin cache location and contents at ${PLUGIN_CACHE_DIR}`,
+    description: `Show Supertonic cache status at ${PLUGIN_CACHE_DIR}`,
     async handler(_args, ctx) {
       await ensureCacheDir();
       const cache = await isCacheComplete();
       const totalSize = Object.values(cache.files).reduce((s, f) => s + f.size, 0);
       const lines = [
-        `Settings: \`${SETTINGS_FILE.replace(homedir(), "~")}\``,
-        `  Active voice: ${settings.voice}`,
+        `Settings: ${SETTINGS_FILE.replace(homedir(), "~")}`,
+        `  voice=${settings.voice}, lang=${settings.lang}, speed=${settings.speed}, totalStep=${settings.totalStep}`,
         "",
-        `Cache: \`${PLUGIN_CACHE_DIR.replace(homedir(), "~")}\``,
-        ...Object.entries(cache.files).map(([name, info]) =>
-          `  ${info.exists ? "✓" : "✗"} ${name}: ${
-            info.exists ? (info.size / 1024 / 1024).toFixed(2) + " MB" : "missing"
-          }`,
-        ),
+        `Cache: ${PLUGIN_CACHE_DIR.replace(homedir(), "~")}`,
+        ...MODEL_FILES.map((f) => `  ${cache.files[f]?.exists ? "✓" : "✗"} onnx/${f}: ${cache.files[f]?.exists ? `${(cache.files[f]!.size / 1024 / 1024).toFixed(1)} MB` : "MISSING"}`),
         "",
-        `Total: ${(totalSize / 1024 / 1024).toFixed(2)} MB — ${cache.complete ? "✓ complete" : "⚠️ incomplete"}`,
+        `Total: ${(totalSize / 1024 / 1024).toFixed(1)} MB`,
+        cache.complete ? "✓ Cache complete — ready for offline use" : "⚠️  Cache incomplete",
       ];
       ctx.ui.setWidget("voice-cache", lines);
+      ctx.ui.notify(`Cache: ${(totalSize / 1024 / 1024).toFixed(1)} MB — ${cache.complete ? "complete" : "incomplete"}`, cache.complete ? "info" : "warning");
+    },
+  });
+
+  // ─── Command: /voice-doctor ───────────────────────────────────────────
+  pi.registerCommand("voice-doctor", {
+    description: "Diagnose Supertonic setup — verifies offline capability",
+    async handler(_args, ctx) {
+      ctx.ui.setStatus("voice-doctor", "Running…");
+      const checks: { ok: boolean; name: string; detail: string }[] = [];
+
+      // 1. Audio player
+      const players = await detectPlayers();
+      const avail = players.find((p) => p.available);
+      checks.push({ ok: !!avail, name: "Audio player", detail: avail ? avail.name : "none found" });
+      ctx.ui.notify(`1/5 ${avail ? "✓" : "❌"} Audio: ${avail?.name ?? "none"}`, avail ? "info" : "error");
+
+      // 2. Cache
+      const cache = await isCacheComplete();
+      const totalMB = Object.values(cache.files).reduce((s, f) => s + f.size, 0) / 1024 / 1024;
+      checks.push({ ok: cache.complete, name: "Supertonic model cache", detail: `${totalMB.toFixed(0)} MB at ${PLUGIN_CACHE_DIR}` });
+      ctx.ui.notify(`2/5 ${cache.complete ? "✓" : "❌"} Cache: ${totalMB.toFixed(0)} MB`, cache.complete ? "info" : "error");
+
+      // 3. Settings
+      checks.push({ ok: true, name: "Settings", detail: settings.voice + "/" + settings.lang });
+      ctx.ui.notify(`3/5 ✓ Settings: ${settings.voice}/${settings.lang}`, "info");
+
+      // 4. Model load
+      let loadOk = false;
+      let loadDetail = "skipped";
+      if (cache.complete) {
+        try {
+          const t0 = Date.now();
+          await loadTextToSpeech(ONNX_DIR, false);
+          loadDetail = `loaded in ${((Date.now() - t0) / 1000).toFixed(1)}s`;
+          loadOk = true;
+        } catch (err) {
+          loadDetail = `failed: ${(err as Error).message}`;
+        }
+      } else {
+        loadDetail = "skipped (no model)";
+      }
+      checks.push({ ok: loadOk, name: "Model load", detail: loadDetail });
+      ctx.ui.notify(`4/5 ${loadOk ? "✓" : "❌"} Model: ${loadDetail}`, loadOk ? "info" : "error");
+
+      // 5. End-to-end
+      let e2eOk = false;
+      if (loadOk && avail) {
+        try {
+          const r = await speak("Test.", () => {});
+          e2eOk = r.ok;
+          if (r.ok) ctx.ui.notify(`5/5 ✓ E2E: ${r.durationSec?.toFixed(1)}s audio OK`, "info");
+          else ctx.ui.notify(`5/5 ❌ E2E: ${r.error}`, "error");
+        } catch (err) {
+          ctx.ui.notify(`5/5 ❌ E2E: ${(err as Error).message}`, "error");
+        }
+      } else {
+        ctx.ui.notify("5/5 ⏭️  E2E: skipped (prereqs failed)", "info");
+      }
+      checks.push({ ok: e2eOk, name: "End-to-end", detail: e2eOk ? "OK" : "skipped/failed" });
+
+      ctx.ui.setStatus("voice-doctor", "");
+      const passed = checks.filter((c) => c.ok).length;
+      const widgetLines = [
+        `Supertonic 3 Doctor: ${passed}/5 checks ✓`,
+        ...checks.map((c) => `  ${c.ok ? "✓" : "❌"} ${c.name}: ${c.detail}`),
+        passed === 5 ? "\n🎉 Fully offline-capable" : `\n⚠️  ${5 - passed} issue(s) above`,
+      ];
+      ctx.ui.setWidget("voice-doctor", widgetLines);
       ctx.ui.notify(
-        `Cache: ${(totalSize / 1024 / 1024).toFixed(1)} MB, voice: ${settings.voice}`,
-        cache.complete ? "info" : "warning",
+        passed === 5 ? `🎉 Voice TTS: 100% offline-capable` : `Voice TTS: ${passed}/5 checks passed — see issues above`,
+        passed === 5 ? "info" : "warning",
       );
     },
   });

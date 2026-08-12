@@ -6,8 +6,9 @@
     "strict": false,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "noEmit": true,
-    "types": ["node"]
+    "outDir": "dist",
+    "rootDir": ".",
+    "declaration": true
   },
-  "include": ["extensions/**/*.ts"]
+  "include": ["extensions/index.ts"]
 }
