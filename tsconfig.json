@@ -7,7 +7,7 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "noResolve": true
+    "types": ["node"]
   },
   "include": ["extensions/**/*.ts"]
 }
