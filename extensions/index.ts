@@ -5,7 +5,7 @@ import { env as hfEnv } from "@huggingface/transformers";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, stat, readdir, writeFile, mkdir } from "node:fs/promises";
 import { existsSync, createWriteStream } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { platform } from "node:process";
 import { createRequire } from "node:module";
@@ -268,14 +268,14 @@ async function downloadModel(onProgress?: (msg: string, percent?: number) => voi
 async function tryModelLoad(): Promise<{
   ok: boolean;
   ms?: number;
-  voices?: string[];
+  voices?: Record<string, unknown>;
   error?: string;
   onnxVersion?: string;
 }> {
   const t0 = Date.now();
   try {
     const m = await KokoroTTS.from_pretrained(MODEL_ID, { dtype: "q8", device: "cpu" });
-    const voices = (m as unknown as { list_voices?: () => string[] }).list_voices?.() ?? [];
+    const voices = (m as unknown as { voices?: Record<string, unknown> }).voices ?? {};
     let onnxVersion = "unknown";
     try {
       const req = createRequire(import.meta.url ?? __filename);
@@ -362,10 +362,38 @@ async function tryPkgVersion(name: string): Promise<string | undefined> {
   return undefined;
 }
 
+// ─── Settings file (user-configurable voice preference) ─────────────────
+// Lets users switch between voices (e.g. am_michael, am_fenrir) without
+// editing the plugin. Set PI_VOICE_SETTINGS env var to override path.
+const SETTINGS_FILE = process.env.PI_VOICE_SETTINGS ?? join(homedir(), ".pi", "voice", "config.json");
+
+interface VoiceSettings {
+  voice: string;
+  // Reserved for future: speed, pitch, language preference
+}
+
+async function loadSettings(): Promise<VoiceSettings> {
+  try {
+    const { readFile } = await import("node:fs/promises");
+    const raw = await readFile(SETTINGS_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return { voice: typeof parsed.voice === "string" ? parsed.voice : DEFAULT_VOICE };
+  } catch {
+    return { voice: DEFAULT_VOICE };
+  }
+}
+
+async function saveSettings(s: VoiceSettings): Promise<void> {
+  const { writeFile, mkdir } = await import("node:fs/promises");
+  await mkdir(dirname(SETTINGS_FILE), { recursive: true });
+  await writeFile(SETTINGS_FILE, JSON.stringify(s, null, 2), "utf8");
+}
+
 // ─── Plugin ──────────────────────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
   let tts: KokoroTTS | null = null;
   let ttsLoading: Promise<KokoroTTS> | null = null;
+  let settings: VoiceSettings = { voice: DEFAULT_VOICE };
 
   async function ensureModelReady(onUpdate?: (msg: string, percent?: number) => void): Promise<void> {
     onUpdate?.("Checking self-managed cache…", 0);
@@ -459,8 +487,9 @@ export default function (pi: ExtensionAPI) {
 
   // ─── Lifecycle ────────────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
+    settings = await loadSettings();
     ctx.ui.notify(
-      `🔊 pi-voice-michael loaded. Cache: ${PLUGIN_CACHE_DIR.replace(homedir(), "~")}. Run /voice-doctor to verify.`,
+      `🔊 pi-voice-michael loaded. Voice: **${settings.voice}** (settings: ${SETTINGS_FILE.replace(homedir(), "~")}). Run /voice-set <name> to change.`,
       "info",
     );
     // Background pre-warm: ensure model is cached and loaded
@@ -494,7 +523,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, onUpdate, _ctx) {
       const { text, voice } = params as { text: string; voice?: string };
-      const v = voice || DEFAULT_VOICE;
+      const v = voice || settings.voice;
       const report = (msg: string, percent?: number) => {
         if (!onUpdate) return;
         try {
@@ -527,11 +556,11 @@ export default function (pi: ExtensionAPI) {
 
   // ─── Command: /say ────────────────────────────────────────────────────
   pi.registerCommand("say", {
-    description: "Speak text aloud using the offline am_michael voice. Usage: /say <text> [voice]",
+    description: "Speak text aloud using the configured voice (default from settings). Usage: /say <text> [voice]",
     async handler(args, ctx) {
       const trimmed = args.trim();
       if (!trimmed) {
-        ctx.ui.notify("Usage: /say <text> [voice]", "warning");
+        ctx.ui.notify(`Usage: /say <text> [voice]  (current voice: ${settings.voice})`, "warning");
         return;
       }
       const quotedMatch = trimmed.match(/^"([^"]+)"(?:\s+(\S+))?$/);
@@ -542,18 +571,82 @@ export default function (pi: ExtensionAPI) {
         voice = quotedMatch[2];
       } else {
         const tokens = trimmed.split(/\s+/);
-        if (tokens.length >= 2 && /^(am|af|bm|bf|jm)_/.test(tokens[tokens.length - 1])) {
+        if (tokens.length >= 2 && /^(am|af|bm|bf|jm|ef|em|ff|hf|hm|if|im|jf|jm|pf|pm|zf|zm)_/.test(tokens[tokens.length - 1])) {
           voice = tokens.pop();
         }
         text = tokens.join(" ");
       }
       ctx.ui.setStatus("pi-voice", "🔊 Initializing…");
-      const r = await speak(text, voice || DEFAULT_VOICE, (msg, pct) => {
+      const r = await speak(text, voice || settings.voice, (msg, pct) => {
         ctx.ui.setStatus("pi-voice", `🔊 ${msg}${pct != null ? ` ${pct}%` : ""}`);
       });
       ctx.ui.setStatus("pi-voice", "");
       if (r.ok) ctx.ui.notify(`🔊 Spoke (${r.voice}): "${text}"`, "info");
       else ctx.ui.notify(`❌ TTS failed: ${r.error}`, "error");
+    },
+  });
+
+  // ─── Command: /voice-set ──────────────────────────────────────────────
+  // Change the configured voice. Persists to ~/.pi/voice/config.json.
+  // Validates against available voices WITHOUT preloading the full model.
+  pi.registerCommand("voice-set", {
+    description: "Set the default voice for voice_say_aloud. Usage: /voice-set <voice_id> (e.g. am_michael, am_fenrir, af_heart)",
+    async handler(args, ctx) {
+      const newVoice = args.trim();
+      if (!newVoice) {
+        ctx.ui.notify(`Current voice: ${settings.voice}\nUsage: /voice-set <voice_id>`, "info");
+        return;
+      }
+      // Quick validation: voice id must match Kokoro naming convention
+      // (lang_gender_name pattern). Doesn't require model to be loaded.
+      if (!/^(af|am|bf|bm|jf|jm|ef|em|ff|hf|hm|if|im|pf|pm|zf|zm)_/.test(newVoice)) {
+        ctx.ui.notify(
+          `❌ Invalid voice id: ${newVoice}\nMust start with one of: af_, am_, bf_, bm_, ef_, em_, ff_, hf_, hm_, if_, im_, jf_, jm_, pf_, pm_, zf_, zm_\nRun /voice-list to see all available.`,
+          "error",
+        );
+        return;
+      }
+      // Save first (fast), then async-validate and warn if invalid
+      const oldVoice = settings.voice;
+      settings.voice = newVoice;
+      await saveSettings(settings);
+      ctx.ui.notify(`✓ Voice set to **${newVoice}**\nSaved to ${SETTINGS_FILE.replace(homedir(), "~")}\nNext /say or voice_say_aloud will use this voice.`, "info");
+      // Background-validate so we can warn if voice doesn't exist
+      (async () => {
+        try {
+          const tts = await ensureTTS();
+          const voices = (tts as unknown as { voices?: Record<string, unknown> }).voices ?? {};
+          if (!Object.keys(voices).includes(newVoice)) {
+            ctx.ui.notify(`⚠️ ${newVoice} is not in Kokoro's voice list. Reverted to ${oldVoice}.`, "error");
+            settings.voice = oldVoice;
+            await saveSettings(settings);
+          }
+        } catch { /* model not loaded yet — try again next time */ }
+      })();
+    },
+  });
+
+  // ─── Command: /voice-list ─────────────────────────────────────────────
+  pi.registerCommand("voice-list", {
+    description: "List all available voices grouped by language",
+    async handler(_args, ctx) {
+      try {
+        const tts = await ensureTTS();
+        const voices = (tts as unknown as { voices?: Record<string, unknown> }).voices ?? {};
+        const grouped: Record<string, string[]> = {};
+        for (const [id, meta] of Object.entries(voices as Record<string, { language?: string; gender?: string }>)) {
+          const lang = meta.language ?? "unknown";
+          (grouped[lang] ??= []).push(`${id} (${meta.gender ?? "?"})`);
+        }
+        const lines: string[] = [`Current voice: ${settings.voice}`, ""];
+        for (const [lang, list] of Object.entries(grouped).sort()) {
+          lines.push(`${lang}: ${list.join(", ")}`);
+        }
+        ctx.ui.setWidget("voice-list", lines);
+        ctx.ui.notify(`Voices loaded (${Object.keys(voices).length} total). See widget for full list.`, "info");
+      } catch (err) {
+        ctx.ui.notify(`❌ Could not load voices: ${(err as Error).message}`, "error");
+      }
     },
   });
 
@@ -628,7 +721,7 @@ export default function (pi: ExtensionAPI) {
 
       // ── 4. Model load test ─────────────────────────────────────────────
       const loadResult = await tryModelLoad();
-      const loadOk = loadResult.ok && (loadResult.voices?.includes(DEFAULT_VOICE) !== false);
+      const loadOk = loadResult.ok && (loadResult.voices?.[DEFAULT_VOICE] !== undefined);
       if (loadResult.ok) {
         ctx.ui.notify(
           `4/5 ✓ Model: loaded in ${(loadResult.ms! / 1000).toFixed(1)}s (ort ${loadResult.onnxVersion})${loadResult.voices ? `, ${loadResult.voices.length} voices` : ""}`,
@@ -702,23 +795,23 @@ export default function (pi: ExtensionAPI) {
     async handler(_args, ctx) {
       await ensureCacheDir();
       const cache = await isCacheComplete();
+      const totalSize = Object.values(cache.files).reduce((s, f) => s + f.size, 0);
       const lines = [
-        `Cache: \`${PLUGIN_CACHE_DIR.replace(homedir(), "~")}\``,
+        `Settings: \`${SETTINGS_FILE.replace(homedir(), "~")}\``,
+        `  Active voice: ${settings.voice}`,
         "",
+        `Cache: \`${PLUGIN_CACHE_DIR.replace(homedir(), "~")}\``,
         ...Object.entries(cache.files).map(([name, info]) =>
           `  ${info.exists ? "✓" : "✗"} ${name}: ${
             info.exists ? (info.size / 1024 / 1024).toFixed(2) + " MB" : "missing"
           }`,
         ),
-      ];
-      const totalSize = Object.values(cache.files).reduce((s, f) => s + f.size, 0);
-      lines.push("");
-      lines.push(
+        "",
         `Total: ${(totalSize / 1024 / 1024).toFixed(2)} MB — ${cache.complete ? "✓ complete" : "⚠️ incomplete"}`,
-      );
+      ];
       ctx.ui.setWidget("voice-cache", lines);
       ctx.ui.notify(
-        `Cache: ${(totalSize / 1024 / 1024).toFixed(1)} MB, ${cache.complete ? "complete" : "incomplete"}`,
+        `Cache: ${(totalSize / 1024 / 1024).toFixed(1)} MB, voice: ${settings.voice}`,
         cache.complete ? "info" : "warning",
       );
     },
