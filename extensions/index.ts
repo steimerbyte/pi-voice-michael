@@ -449,53 +449,124 @@ export default function (pi: ExtensionAPI) {
     text: string,
     voice: string,
     onUpdate?: (msg: string, percent?: number) => void,
-  ): Promise<{ ok: boolean; voice: string; text: string; file?: string; error?: string; chunks?: number; detached: true }> {
-    // Do NOT await playback inside this function — return immediately so the
-    // tool call completes. Generation + playback continues in background.
-    void (async () => {
+  ): Promise<{ ok: boolean; voice: string; text: string; file?: string; error?: string; chunks?: number; totalChunks?: number }> {
+    try {
+      onUpdate?.("Initializing…", 2);
+      const t0 = Date.now();
+      const model = await ensureTTS((msg, pct) => onUpdate?.(msg, pct));
+      onUpdate?.(`Model loaded in ${((Date.now() - t0) / 1000).toFixed(1)}s`, 8);
+
+      // Coalesce input sentences into chunks. Kokoro caps output at ~30s of
+      // audio per generate() call (~510 phoneme tokens); longer inputs
+      // get truncated to that limit. We split into chunks of ~10 sentences
+      // each so generation succeeds deterministically. Empirically each
+      // chunk yields ~10–30s of audio depending on text length.
+      const sentences = splitSentences(text);
+      const CHUNK_SENTENCES = 10;
+      const chunks: string[] = [];
+      for (let i = 0; i < sentences.length; i += CHUNK_SENTENCES) {
+        chunks.push(sentences.slice(i, i + CHUNK_SENTENCES).join(" "));
+      }
+      const total = chunks.length;
+      onUpdate?.(`Split into ${total} chunks of up to ${CHUNK_SENTENCES} sentences each`, 12);
+
+      // Streaming pipeline: generate chunk N+1 while chunk N plays.
+      // We use a single mpv process that we feed WAV paths to one at a time.
+      // Between chunks we do NOT close mpv — so playback is gapless.
+      const { spawn } = await import("node:child_process");
+      let mpv: ReturnType<typeof spawn> | null = null;
       try {
-        const t0 = Date.now();
-        const model = await ensureTTS((msg, pct) => onUpdate?.(`[bg] ${msg}`, pct));
-        onUpdate?.(`[bg] Model ready in ${((Date.now() - t0) / 1000).toFixed(1)}s`, 60);
-
-        const sentences = splitSentences(text);
-        const total = sentences.length;
-        const chunks = total === 1 ? 1 : Math.max(1, total);
-
-        // Write each chunk to a temp file and queue it for playback. We use
-        // sequential await (NOT Promise.all) so chunks play in order.
-        for (let i = 0; i < total; i++) {
-          const sentence = sentences[i];
-          const dir = await mkdtemp(join(tmpdir(), "pi-voice-"));
-          const wavPath = join(dir, `s-${i}-${Date.now()}.wav`);
-          const t1 = Date.now();
-          try {
-            const audio = await model.generate(sentence, { voice } as unknown as Record<string, string>);
-            await audio.save(wavPath);
-            try { (audio as unknown as { data?: Float32Array }).data = undefined; } catch {}
-            const genMs = Date.now() - t1;
-            const pct = 65 + Math.floor(((i + 1) / total) * 30);
-            onUpdate?.(`[bg] Chunk ${i + 1}/${total} (${sentence.length}ch) gen in ${(genMs / 1000).toFixed(1)}s`, pct);
-            // Await playback — this is what couples order to playback. Each
-            // await blocks until paplay exits for that chunk.
-            await playWav(wavPath);
-          } finally {
-            // Cleanup the chunk's temp dir (fire-and-forget rm).
-            void rm(dir, { recursive: true, force: true }).catch(() => {});
-          }
-        }
-        onUpdate?.(`[bg] Done — ${total} chunks played`, 100);
+        mpv = spawn("mpv", [
+          "--no-video",
+          "--no-terminal",
+          "--really-quiet",
+          "--gapless-audio",
+          "--keep-open=no",
+          "--",  // separator; everything after is a playlist
+          "fd://0",  // read filenames from stdin (we'll write paths in)
+        ], { stdio: ["pipe", "ignore", "ignore"] });
       } catch (err) {
-        onUpdate?.(`[bg] ERROR: ${(err as Error).message}`, 100);
+        // Fallback: spawn failed (mpv not installed), use per-file paplay
+        onUpdate?.(`mpv unavailable, falling back to sequential paplay`, 15);
+        mpv = null;
+      }
+
+      let playedChunks = 0;
+      const tempDirs: string[] = [];
+
+      try {
+        // Streaming pipeline: generate chunk N+1 while chunk N is playing.
+        // Stage 1: kick off generation for all chunks in parallel. Each chunk
+        // produces a Promise<wavPath> that resolves when ready.
+        const readyPromises: Promise<{ idx: number; wavPath: string } | { idx: number; error: Error }>[] =
+          chunks.map(async (chunkText, idx): Promise<{ idx: number; wavPath: string } | { idx: number; error: Error }> => {
+            const dir = await mkdtemp(join(tmpdir(), "pi-voice-"));
+            tempDirs.push(dir);
+            const wavPath = join(dir, `c-${idx}-${Date.now()}.wav`);
+            try {
+              const t1 = Date.now();
+              onUpdate?.(`Generating chunk ${idx + 1}/${total}…`, 15 + Math.floor((idx / total) * 70));
+              const audio = await model.generate(chunkText, { voice } as unknown as Record<string, string>);
+              await audio.save(wavPath);
+              const genMs = Date.now() - t1;
+              onUpdate?.(`Chunk ${idx + 1}/${total} ready in ${(genMs / 1000).toFixed(1)}s`, 15 + Math.floor(((idx + 1) / total) * 70));
+              return { idx, wavPath };
+            } catch (err) {
+              return { idx, error: err as Error };
+            }
+          });
+
+        // Stage 2: as each chunk becomes ready, push it to mpv (gapless) or
+        // play sequentially via paplay (fallback). Promise.race on each
+        // ready index ensures first-available-first-played ordering.
+        const playNext = async () => {
+          for (const p of readyPromises) {
+            const result = await p;
+            if ("error" in result) {
+              onUpdate?.(`Chunk ${result.idx + 1}/${total} generation failed: ${result.error.message}`, 100);
+              continue;
+            }
+            const wavPath = result.wavPath;
+            if (mpv && !mpv.killed && mpv.stdin?.writable) {
+              mpv.stdin.write(wavPath + "\n");
+            } else {
+              await playWav(wavPath).catch((err) => {
+                onUpdate?.(`Playback failed: ${(err as Error).message}`, 100);
+              });
+            }
+            playedChunks++;
+          }
+        };
+
+        // Start playing in background, don't await yet — let it run as
+        // chunks become available.
+        const playPromise = playNext();
+
+        // Wait for all playback to complete
+        await playPromise;
+        onUpdate?.(`All ${playedChunks} chunks played`, 95);
+
+        // Wait for mpv to drain its playlist (it reads stdin until EOF).
+        if (mpv && !mpv.killed) {
+          mpv.stdin?.end();
+          await new Promise<void>((resolve) => {
+            mpv!.on("exit", () => resolve());
+            // Safety timeout: if mpv hangs, don't block forever
+            setTimeout(() => resolve(), 30 * 60 * 1000);
+          });
+        }
+        onUpdate?.(`Playback complete (${playedChunks} chunks)`, 100);
+        return { ok: true, voice, text, chunks: playedChunks, totalChunks: total };
       } finally {
+        if (mpv && !mpv.killed) {
+          mpv.kill();
+        }
+        for (const d of tempDirs) void rm(d, { recursive: true, force: true }).catch(() => {});
         scheduleIdleUnload();
       }
-    })();
-
-    // Return IMMEDIATELY — don't await playback. Tool call finishes here,
-    // pi shows the user the success message, but the background promise
-    // above keeps generating + playing until all chunks are spoken.
-    return { ok: true, voice, text, file: undefined, chunks: 0, detached: true };
+    } catch (err: unknown) {
+      return { ok: false, voice, text, error: (err as Error)?.message ?? String(err) };
+    }
   }
 
   // ─── Idle unload: release Kokoro after 5min of inactivity ────────────
