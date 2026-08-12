@@ -16,6 +16,8 @@ interface SpeakResult {
   error?: string;
 }
 
+type AgentToolUpdateCallback<T = unknown> = (update: { content?: string; details?: T; isError?: boolean }) => void;
+
 function pickPlayer(): { cmd: string; args: (path: string) => string[] } | null {
   const p = process.platform;
   if (p === "darwin") return { cmd: "afplay", args: (f) => [f] };
@@ -23,7 +25,6 @@ function pickPlayer(): { cmd: string; args: (path: string) => string[] } | null 
     cmd: "powershell",
     args: (f) => ["-NoProfile", "-Command", `Add-Type -AssemblyName PresentationCore; (New-Object System.Media.SoundPlayer '${f.replace(/'/g, "''")}').PlaySync()`],
   };
-  // Linux: chain through paplay > pw-play > aplay
   return {
     cmd: "sh",
     args: (f) => ["-c", `command -v paplay >/dev/null && paplay '${f}' || (command -v pw-play >/dev/null && pw-play '${f}' || aplay -q '${f}')`],
@@ -33,7 +34,6 @@ function pickPlayer(): { cmd: string; args: (path: string) => string[] } | null 
 function playWav(wavPath: string): Promise<void> {
   const player = pickPlayer();
   if (!player) return Promise.reject(new Error(`No audio player for platform ${process.platform}`));
-
   return new Promise((resolve, reject) => {
     const proc = spawn(player.cmd, player.args(wavPath), { stdio: "ignore" });
     proc.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`audio player exited ${code}`))));
@@ -42,33 +42,37 @@ function playWav(wavPath: string): Promise<void> {
 }
 
 export default function (pi: ExtensionAPI) {
-  // Per-session state. The official docs warn against starting background
-  // resources in the factory itself — defer to session_start and clean up on
-  // session_shutdown.
   let tts: KokoroTTS | null = null;
   let ttsLoading: Promise<KokoroTTS> | null = null;
 
-  async function ensureTTS(): Promise<KokoroTTS> {
+  async function ensureTTS(onUpdate?: AgentToolUpdateCallback): Promise<KokoroTTS> {
     if (tts) return tts;
     if (!ttsLoading) {
+      onUpdate?.({ content: "⏳ Loading Kokoro TTS model (~90MB, first run only)..." });
       ttsLoading = KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-ONNX", {
         dtype: "q8",
         device: "cpu",
       }).then((m) => {
+        onUpdate?.({ content: "✅ Kokoro model loaded, generating speech..." });
         tts = m;
         return m;
       });
+    } else {
+      onUpdate?.({ content: "⏳ Model already loading, please wait..." });
     }
     return ttsLoading;
   }
 
-  async function speak(text: string, voice: string = DEFAULT_VOICE): Promise<SpeakResult> {
+  async function speak(text: string, voice: string = DEFAULT_VOICE, onUpdate?: AgentToolUpdateCallback): Promise<SpeakResult> {
     try {
-      const model = await ensureTTS();
+      onUpdate?.({ content: `🎤 Synthesizing: "${text.substring(0, 60)}${text.length > 60 ? "..." : ""}"` });
+      const model = await ensureTTS(onUpdate);
       const audio = await model.generate(text, { voice } as any);
+      onUpdate?.({ content: "💾 Saving audio file..." });
       const dir = await mkdtemp(join(tmpdir(), "pi-voice-"));
       const wavPath = join(dir, `speech-${Date.now()}.wav`);
       await audio.save(wavPath);
+      onUpdate?.({ content: `🔊 Playing: ${wavPath}` });
       try {
         await playWav(wavPath);
       } finally {
@@ -80,24 +84,17 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // ─── Lifecycle: lazy load + cleanup ────────────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.notify("🔊 pi-voice-michael loaded (Kokoro TTS am_michael)", "info");
-    // Don't pre-load the model here; it costs ~90MB RAM and ~3s. Do it on first
-    // tool call. But mark loading intent so concurrent calls share one promise.
-    ensureTTS().catch(() => {/* surface on first call */});
+    ctx.ui.notify("🔊 pi-voice-michael ready (Kokoro am_michael)", "info");
+    // Pre-warm the model in background so first real call is faster
+    ensureTTS().catch(() => {});
   });
 
   pi.on("session_shutdown", async () => {
-    // No persistent background resources were started, nothing to clean up.
-    // Kokoro holds the model in-memory; let GC reclaim it.
     tts = null;
     ttsLoading = null;
   });
 
-  // ─── Tool: voice_say_aloud ────────────────────────────────────────────
-  // Per official docs: tools must use `execute(toolCallId, params, signal,
-  // onUpdate, ctx)` and return `{ content: [{type:"text", text}], ... }`.
   pi.registerTool({
     name: "voice_say_aloud",
     label: "Speak Aloud (am_michael)",
@@ -116,9 +113,9 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
 
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
+    async execute(_id, params, _signal, onUpdate, _ctx) {
       const { text, voice } = params as { text: string; voice?: string };
-      const r = await speak(text, voice || DEFAULT_VOICE);
+      const r = await speak(text, voice || DEFAULT_VOICE, onUpdate as AgentToolUpdateCallback);
       if (r.ok) {
         return {
           content: [{ type: "text", text: `🔊 Spoke aloud (${r.voice}): "${text}"` }],
@@ -126,16 +123,13 @@ export default function (pi: ExtensionAPI) {
         };
       }
       return {
-        content: [{ type: "text", text: `❌ TTS playback failed: ${r.error}\nMake sure paplay/aplay/afplay is installed and on PATH.` }],
+        content: [{ type: "text", text: `❌ TTS playback failed: ${r.error}` }],
         details: r,
         isError: true,
       };
     },
   });
 
-  // ─── Command: /say ────────────────────────────────────────────────────
-  // Per official docs: registerCommand(name, { description, handler }).
-  // handler receives raw `args: string` — we parse it lightly.
   pi.registerCommand("say", {
     description: "Speak text aloud using the offline am_michael voice. Usage: /say <text> [voice]",
     async handler(args, ctx) {
@@ -144,7 +138,6 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Usage: /say <text> [voice]", "warning");
         return;
       }
-      // Allow: /say "some text" voice_name  OR  /say some text  OR  /say some text voice
       const quotedMatch = trimmed.match(/^"([^"]+)"(?:\s+(\S+))?$/);
       let text: string;
       let voice: string | undefined;
@@ -153,14 +146,12 @@ export default function (pi: ExtensionAPI) {
         voice = quotedMatch[2];
       } else {
         const tokens = trimmed.split(/\s+/);
-        // If last token matches a known voice pattern (am_/af_/bm_/bf_/jm_), treat as voice
         if (tokens.length >= 2 && /^(am|af|bm|bf|jm)_/.test(tokens[tokens.length - 1])) {
           voice = tokens.pop();
         }
         text = tokens.join(" ");
       }
-
-      ctx.ui.notify("Loading Kokoro TTS (first run may take ~5s)...", "info");
+      ctx.ui.notify("🎤 Synthesizing speech...", "info");
       const r = await speak(text, voice || DEFAULT_VOICE);
       if (r.ok) {
         ctx.ui.notify(`🔊 Spoke (${r.voice}): "${text}"`, "info");
