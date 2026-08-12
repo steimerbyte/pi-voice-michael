@@ -495,64 +495,77 @@ export default function (pi: ExtensionAPI) {
       const tempDirs: string[] = [];
 
       try {
-        // Streaming pipeline: generate chunk N+1 while chunk N is playing.
-        // Stage 1: kick off generation for all chunks in parallel. Each chunk
-        // produces a Promise<wavPath> that resolves when ready.
-        const readyPromises: Promise<{ idx: number; wavPath: string } | { idx: number; error: Error }>[] =
-          chunks.map(async (chunkText, idx): Promise<{ idx: number; wavPath: string } | { idx: number; error: Error }> => {
-            const dir = await mkdtemp(join(tmpdir(), "pi-voice-"));
-            tempDirs.push(dir);
-            const wavPath = join(dir, `c-${idx}-${Date.now()}.wav`);
-            try {
-              const t1 = Date.now();
-              onUpdate?.(`Generating chunk ${idx + 1}/${total}…`, 15 + Math.floor((idx / total) * 70));
-              const audio = await model.generate(chunkText, { voice } as unknown as Record<string, string>);
-              await audio.save(wavPath);
-              const genMs = Date.now() - t1;
-              onUpdate?.(`Chunk ${idx + 1}/${total} ready in ${(genMs / 1000).toFixed(1)}s`, 15 + Math.floor(((idx + 1) / total) * 70));
-              return { idx, wavPath };
-            } catch (err) {
-              return { idx, error: err as Error };
-            }
-          });
-
-        // Stage 2: as each chunk becomes ready, push it to mpv (gapless) or
-        // play sequentially via paplay (fallback). Promise.race on each
-        // ready index ensures first-available-first-played ordering.
-        const playNext = async () => {
-          for (const p of readyPromises) {
-            const result = await p;
-            if ("error" in result) {
-              onUpdate?.(`Chunk ${result.idx + 1}/${total} generation failed: ${result.error.message}`, 100);
-              continue;
-            }
-            const wavPath = result.wavPath;
-            if (mpv && !mpv.killed && mpv.stdin?.writable) {
-              mpv.stdin.write(wavPath + "\n");
-            } else {
-              await playWav(wavPath).catch((err) => {
-                onUpdate?.(`Playback failed: ${(err as Error).message}`, 100);
-              });
-            }
-            playedChunks++;
+        // Staged streaming pipeline:
+        //   Stage 1 (Pre-roll):  Generate first 2 chunks in parallel.
+        //   Stage 2 (Streaming):  Start mpv playback, then generate remaining
+        //                         chunks in sequence (one at a time). Each
+        //                         chunk becomes ready while the previous is
+        //                         still playing, so total time = max(gen_time,
+        //                         play_time) rather than sum.
+        //
+        // Why sequential after pre-roll? ONNX runtime internally serializes
+        // parallel calls, so parallel generation saves no wall time but uses
+        // N× the RAM. Sequential keeps memory bounded.
+        const CONCURRENCY = 2; // pre-roll only
+        const resultFor = async (idx: number): Promise<{ idx: number; wavPath: string } | { idx: number; error: Error }> => {
+          const chunkText = chunks[idx];
+          const dir = await mkdtemp(join(tmpdir(), "pi-voice-"));
+          tempDirs.push(dir);
+          const wavPath = join(dir, `c-${idx}-${Date.now()}.wav`);
+          try {
+            const t1 = Date.now();
+            onUpdate?.(`Generating chunk ${idx + 1}/${total}…`, 15 + Math.floor((idx / total) * 70));
+            const audio = await model.generate(chunkText, { voice } as unknown as Record<string, string>);
+            await audio.save(wavPath);
+            const genMs = Date.now() - t1;
+            onUpdate?.(`Chunk ${idx + 1}/${total} ready in ${(genMs / 1000).toFixed(1)}s`, 15 + Math.floor(((idx + 1) / total) * 70));
+            return { idx, wavPath };
+          } catch (err) {
+            return { idx, error: err as Error };
           }
         };
 
-        // Start playing in background, don't await yet — let it run as
-        // chunks become available.
-        const playPromise = playNext();
+        // Pre-roll: generate first CONCURRENCY chunks in parallel
+        const queue: Array<Promise<{ idx: number; wavPath: string } | { idx: number; error: Error }>> = [];
+        for (let i = 0; i < Math.min(CONCURRENCY, total); i++) {
+          queue.push(resultFor(i));
+        }
 
-        // Wait for all playback to complete
-        await playPromise;
+        // Consume ready chunks: each iteration pulls the next-ready chunk
+        // and pushes it into mpv (gapless). When a chunk is consumed, start
+        // generating the next one. This overlaps generation with playback.
+        for (let consumed = 0; consumed < total; consumed++) {
+          // Wait for the next chunk to be ready
+          const result = await queue.shift()!;
+          if ("error" in result) {
+            onUpdate?.(`Chunk ${result.idx + 1}/${total} generation failed: ${result.error.message}`, 100);
+            continue;
+          }
+          const wavPath = result.wavPath;
+          if (mpv && !mpv.killed && mpv.stdin?.writable) {
+            // Push to mpv playlist. mpv plays gaplessly.
+            mpv.stdin.write(wavPath + "\n");
+          } else {
+            // Fallback: per-file paplay. Gap between chunks is small.
+            await playWav(wavPath).catch((err) => {
+              onUpdate?.(`Playback failed: ${(err as Error).message}`, 100);
+            });
+          }
+          playedChunks++;
+          // Schedule next chunk generation (overlaps with playback)
+          const nextIdx = consumed + CONCURRENCY;
+          if (nextIdx < total) {
+            queue.push(resultFor(nextIdx));
+          }
+        }
         onUpdate?.(`All ${playedChunks} chunks played`, 95);
 
-        // Wait for mpv to drain its playlist (it reads stdin until EOF).
+        // Wait for mpv to drain its playlist
         if (mpv && !mpv.killed) {
           mpv.stdin?.end();
           await new Promise<void>((resolve) => {
             mpv!.on("exit", () => resolve());
-            // Safety timeout: if mpv hangs, don't block forever
-            setTimeout(() => resolve(), 30 * 60 * 1000);
+            setTimeout(() => resolve(), 30 * 60 * 1000); // 30 min hard cap
           });
         }
         onUpdate?.(`Playback complete (${playedChunks} chunks)`, 100);
